@@ -5,6 +5,7 @@
 #include <Adafruit_GFX.h>
 #include <PZEM004Tv30.h>
 #include <WebServer.h>
+#include <Preferences.h>
 #include "config.h"
 
 // Vehicle states based on CP voltage
@@ -30,6 +31,7 @@ enum ChargerState {
 Adafruit_SH1106G display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 PZEM004Tv30 pzem(Serial1, PZEM_RX_PIN, PZEM_TX_PIN);
 WebServer server(WEB_SERVER_PORT);
+Preferences preferences;
 
 VehicleState currentVehicleState = STATE_A;
 VehicleState previousVehicleState = STATE_A;
@@ -56,14 +58,52 @@ unsigned long lastPZEMRead = 0;
 unsigned long chargingStartTime = 0;
 unsigned long chargingDuration = 0;
 unsigned long lastWiFiCheck = 0;
+unsigned long wifiStartTime = 0;
 bool contactorClosed = false;
 bool wifiConnected = false;
+bool wifiConnecting = false;
 
 int PWM_DutyCycle = 0;
+
+// ========================================
+// PREFERENCES (FLASH STORAGE) FUNCTIONS
+// ========================================
+
+void loadSettings() {
+  preferences.begin("evse", false); // Open in read-write mode
+  
+  // Load charging current from flash, default to DEFAULT_CURRENT if not found
+  chargingCurrent = preferences.getFloat("chargeCurrent", DEFAULT_CURRENT);
+  
+  // Validate the loaded value
+  if (chargingCurrent < MIN_CURRENT || chargingCurrent > MAX_CURRENT) {
+    Serial.println("Invalid stored current, using default");
+    chargingCurrent = DEFAULT_CURRENT;
+  } else {
+    Serial.print("Loaded charging current from memory: ");
+    Serial.print(chargingCurrent);
+    Serial.println("A");
+  }
+  
+  preferences.end();
+}
+
+void saveChargingCurrent() {
+  preferences.begin("evse", false); // Open in read-write mode
+  preferences.putFloat("chargeCurrent", chargingCurrent);
+  preferences.end();
+  
+  Serial.print("Saved charging current to memory: ");
+  Serial.print(chargingCurrent);
+  Serial.println("A");
+}
 
 void setup() {
   Serial.begin(115200);
   Serial.println("EV Charger Starting...");
+  
+  // Load saved settings from flash memory
+  loadSettings();
   
   // Initialize pins
   pinMode(CONTACTOR_PIN, OUTPUT);
@@ -99,9 +139,15 @@ void setup() {
   display.display();
   delay(2000);
 
-  // Connect to WiFi with improved reliability
-  Serial.println("Configuring WiFi...");
-  
+  // Start WiFi connection in non-blocking mode
+  Serial.println("Starting WiFi connection...");
+  startWiFiConnection();
+
+  Serial.println("Setup complete!");
+}
+
+// Start WiFi connection in non-blocking mode
+void startWiFiConnection() {
   // Disconnect any previous connections
   WiFi.disconnect(true);
   delay(100);
@@ -121,94 +167,51 @@ void setup() {
   Serial.print("Connecting to WiFi: ");
   Serial.println(WIFI_SSID);
   
-  int wifiAttempts = 0;
-  const int maxWifiAttempts = WIFI_TIMEOUT_SECONDS;
+  wifiConnecting = true;
+  wifiStartTime = millis();
+}
+
+// Check WiFi connection status (non-blocking)
+void checkWiFiConnection() {
+  if (!wifiConnecting) {
+    return;
+  }
   
-  while (WiFi.status() != WL_CONNECTED && wifiAttempts < maxWifiAttempts) {
-    delay(500);
-    Serial.print(".");
-    wifiAttempts++;
+  unsigned long elapsed = (millis() - wifiStartTime) / 1000;
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiConnected = true;
+    wifiConnecting = false;
+    Serial.println();
+    Serial.print("Connected to WiFi. IP address: ");
+    Serial.println(WiFi.localIP());
     
-    // Update display every 2 seconds to avoid flickering
-    if (wifiAttempts % 2 == 0) {
-      display.clearDisplay();
-      display.setCursor(0, 0);
-      display.println("Connecting WiFi...");
-      display.print("SSID: ");
-      display.println(WIFI_SSID);
-      display.print("Attempt: ");
-      display.print(wifiAttempts / 2);
-      display.print("/");
-      display.println(maxWifiAttempts / 2);
-      
-      // Show WiFi status
-      display.print("Status: ");
-      switch(WiFi.status()) {
-        case WL_IDLE_STATUS:
-          display.println("Idle");
-          break;
-        case WL_NO_SSID_AVAIL:
-          display.println("SSID not found");
-          break;
-        case WL_CONNECT_FAILED:
-          display.println("Failed");
-          break;
-        case WL_CONNECTION_LOST:
-          display.println("Lost");
-          break;
-        case WL_DISCONNECTED:
-          display.println("Disconnected");
-          break;
-        default:
-          display.println("Connecting...");
-      }
-      display.display();
-    }
-    
-    // If connection fails, try reconnecting
-    if (wifiAttempts % 20 == 0 && wifiAttempts > 0) {
+    setupWebServer();
+    return;
+  }
+  
+  // Check timeout
+  if (elapsed >= WIFI_TIMEOUT_SECONDS) {
+    wifiConnected = false;
+    wifiConnecting = false;
+    Serial.println();
+    Serial.println("WiFi connection timeout!");
+    Serial.println("Continuing without WiFi...");
+    return;
+  }
+  
+  // Retry every 20 seconds
+  if (elapsed > 0 && elapsed % 20 == 0) {
+    static unsigned long lastRetry = 0;
+    if (millis() - lastRetry > 1000) {
+      lastRetry = millis();
       Serial.println();
-      Serial.println("Retrying connection...");
+      Serial.println("Retrying WiFi connection...");
       WiFi.disconnect();
       delay(100);
       WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     }
   }
-  
-  Serial.println();
-  
-  if (WiFi.status() == WL_CONNECTED) {
-    wifiConnected = true;
-    Serial.print("Connected to WiFi. IP address: ");
-    Serial.println(WiFi.localIP());
-
-    // Update display with IP
-    display.clearDisplay();
-    display.setCursor(0, 0);
-    display.println("WiFi Connected!");
-    display.print("IP: ");
-    display.println(WiFi.localIP());
-    display.display();
-    delay(2000);
-    
-    setupWebServer();
-  } else {
-    wifiConnected = false;
-    Serial.println("WiFi connection failed!");
-    Serial.println("Continuing without WiFi...");
-    
-    // Update display with failure message
-    display.clearDisplay();
-    display.setCursor(0, 0);
-    display.println("WiFi Failed!");
-    display.println("Check credentials");
-    display.println("Charger will work");
-    display.println("without web access");
-    display.display();
-    delay(3000);
-  }
-
-  Serial.println("Setup complete!");
 }
 
 // Function to read analog with peak detection (from example)
@@ -253,7 +256,12 @@ int chargingPWM(int ampsToConvert) {
 void loop() {
   unsigned long currentMillis = millis();
 
-  // Check WiFi connection status every 30 seconds
+  // Check WiFi connection status (non-blocking)
+  if (wifiConnecting) {
+    checkWiFiConnection();
+  }
+
+  // Check WiFi connection status every 30 seconds (if already connected)
   if (currentMillis - lastWiFiCheck >= 30000) {
     lastWiFiCheck = currentMillis;
     
@@ -280,6 +288,8 @@ void loop() {
       delay(100);
       WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
       Serial.println("Reconnecting to WiFi...");
+      wifiConnecting = true;
+      wifiStartTime = millis();
     }
   }
 
@@ -494,7 +504,13 @@ void updateDisplay() {
 
   // IP Address (always show if WiFi connected) or Charging duration
   display.setCursor(0, 54);
-  if (wifiConnected && WiFi.status() == WL_CONNECTED) {
+  if (wifiConnecting) {
+    // Show WiFi connecting status
+    unsigned long elapsed = (millis() - wifiStartTime) / 1000;
+    display.print("WiFi: ");
+    display.print(elapsed);
+    display.print("s...");
+  } else if (wifiConnected && WiFi.status() == WL_CONNECTED) {
     display.print("IP: ");
     display.println(WiFi.localIP());
   } else if (chargerState == CHARGER_CHARGING || chargingDuration > 0) {
@@ -511,6 +527,8 @@ void updateDisplay() {
     display.print("m ");
     display.print(seconds);
     display.print("s");
+  } else {
+    display.print("WiFi: Offline");
   }
   
   display.display();
@@ -1063,8 +1081,9 @@ const char* getSettingsHTMLTemplate() {
       </div>
 
       <div class="info-box">
-        <strong>Note:</strong> Settings are applied immediately but are not saved to permanent storage. 
-        They will reset to defaults on reboot. Future versions may include EEPROM/Flash storage.
+        <strong>Note:</strong> Charging current settings are automatically saved to flash memory 
+        and will persist after reboot. Other settings (max/min limits, auto-start, display interval, 
+        and debug mode) are applied immediately but will reset to defaults on reboot.
       </div>
 
       <div>
@@ -1144,6 +1163,10 @@ void handleSetCurrent() {
     // Validate current range using configured limits
     if (newCurrent >= minCurrentLimit && newCurrent <= maxCurrentLimit) {
       chargingCurrent = newCurrent;
+      
+      // Save to flash memory
+      saveChargingCurrent();
+      
       if (serialDebugEnabled) {
         Serial.print("Web: Current set to ");
         Serial.print(chargingCurrent);
@@ -1245,6 +1268,10 @@ void handleSaveSettings() {
     float newCurrent = server.arg("defaultCurrent").toFloat();
     if (newCurrent >= 6 && newCurrent <= 32) {
       chargingCurrent = newCurrent;
+      
+      // Save to flash memory
+      saveChargingCurrent();
+      
       updated = true;
       if (serialDebugEnabled) {
         Serial.print("Settings: Default current set to ");
@@ -1331,6 +1358,9 @@ void handleResetSettings() {
   autoStartCharging = true;
   displayUpdateInterval = 500;
   serialDebugEnabled = true;
+  
+  // Save default current to flash memory
+  saveChargingCurrent();
   
   Serial.println("Settings: Reset to factory defaults");
   
