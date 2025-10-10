@@ -37,6 +37,11 @@ VehicleState currentVehicleState = STATE_A;
 VehicleState previousVehicleState = STATE_A;
 ChargerState chargerState = CHARGER_IDLE;
 
+// State change safety timing
+unsigned long stateChangeTime = 0;
+unsigned long stateCReadyTime = 0;
+bool stateStable = false;
+
 float chargingCurrent = DEFAULT_CURRENT;
 float voltage = 0;
 float current = 0;
@@ -50,7 +55,6 @@ float maxCurrentLimit = MAX_CURRENT;
 float minCurrentLimit = MIN_CURRENT;
 bool autoStartCharging = true;
 int displayUpdateInterval = 500;
-bool serialDebugEnabled = true;
 
 unsigned long lastDisplayUpdate = 0;
 unsigned long lastStateCheck = 0;
@@ -71,38 +75,25 @@ int PWM_DutyCycle = 0;
 // ========================================
 
 void loadSettings() {
-  preferences.begin("evse", false); // Open in read-write mode
-  
-  // Load charging current from flash, default to DEFAULT_CURRENT if not found
+  preferences.begin("evse", false);
   chargingCurrent = preferences.getFloat("chargeCurrent", DEFAULT_CURRENT);
   
   // Validate the loaded value
   if (chargingCurrent < MIN_CURRENT || chargingCurrent > MAX_CURRENT) {
-    Serial.println("Invalid stored current, using default");
     chargingCurrent = DEFAULT_CURRENT;
-  } else {
-    Serial.print("Loaded charging current from memory: ");
-    Serial.print(chargingCurrent);
-    Serial.println("A");
   }
   
   preferences.end();
 }
 
 void saveChargingCurrent() {
-  preferences.begin("evse", false); // Open in read-write mode
+  preferences.begin("evse", false);
   preferences.putFloat("chargeCurrent", chargingCurrent);
   preferences.end();
-  
-  Serial.print("Saved charging current to memory: ");
-  Serial.print(chargingCurrent);
-  Serial.println("A");
 }
 
 void setup() {
-  Serial.begin(115200);
-  Serial.println("EV Charger Starting...");
-  
+  // Serial.begin(115200);
   // Load saved settings from flash memory
   loadSettings();
   
@@ -112,14 +103,13 @@ void setup() {
   pinMode(CP_SENSE_PIN, INPUT);
   pinMode(CP_PWM_PIN, OUTPUT);
   
-  // Initialize PWM for CP signal - UPDATED FOR NEW ESP32 CORE
+  // Initialize PWM for CP signal
   if (!ledcAttach(CP_PWM_PIN, PWM_FREQ, PWM_RESOLUTION)) {
-    Serial.println("Failed to attach PWM to pin!");
-    while(1);
+    while(1); // Halt if PWM fails
   }
   
   // Start with 100% duty cycle (12V)
-  PWM_DutyCycle = 1023; // 100% duty cycle for standby
+  PWM_DutyCycle = 1023;
   ledcWrite(CP_PWM_PIN, PWM_DutyCycle);
   
   // Initialize I2C for OLED
@@ -127,7 +117,6 @@ void setup() {
 
   // Initialize OLED display
   if (!display.begin(I2C_ADDRESS, true)) {
-    Serial.println(F("SH1106 allocation failed"));
     while (1); // Halt if display fails
   }
 
@@ -141,32 +130,21 @@ void setup() {
   delay(2000);
 
   // Start WiFi connection in non-blocking mode
-  Serial.println("Starting WiFi connection...");
   startWiFiConnection();
-
-  Serial.println("Setup complete!");
 }
 
 // Start WiFi connection in non-blocking mode
 void startWiFiConnection() {
-  // Disconnect any previous connections
   WiFi.disconnect(true);
   delay(100);
   
-  // Set WiFi mode to station
   WiFi.mode(WIFI_STA);
   delay(100);
   
-  // Optional: Set hostname
   WiFi.setHostname("EV-Charger");
-  
-  // Set power save mode off for better reliability
   WiFi.setSleep(false);
   
-  // Begin WiFi connection
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.print("Connecting to WiFi: ");
-  Serial.println(WIFI_SSID);
   
   wifiConnecting = true;
   wifiConnected = false;
@@ -176,39 +154,22 @@ void startWiFiConnection() {
 
 // Start Access Point mode (fallback when WiFi connection fails)
 void startAPMode() {
-  Serial.println("Starting Access Point mode...");
-  
-  // Disconnect from any WiFi network
   WiFi.disconnect(true);
   delay(100);
   
-  // Configure Access Point
   WiFi.mode(WIFI_AP);
   delay(100);
   
-  // Set custom IP configuration
   WiFi.softAPConfig(AP_IP, AP_GATEWAY, AP_SUBNET);
   
-  // Start Access Point
   bool apStarted = WiFi.softAP(AP_SSID, AP_PASSWORD);
   
   if (apStarted) {
-    Serial.println("Access Point started successfully!");
-    Serial.print("AP SSID: ");
-    Serial.println(AP_SSID);
-    Serial.print("AP Password: ");
-    Serial.println(AP_PASSWORD);
-    Serial.print("AP IP address: ");
-    Serial.println(WiFi.softAPIP());
-    
     isAPMode = true;
-    wifiConnected = true;  // Mark as connected for web server
+    wifiConnected = true;
     wifiConnecting = false;
-    
-    // Start web server in AP mode
     setupWebServer();
   } else {
-    Serial.println("Failed to start Access Point!");
     isAPMode = false;
     wifiConnected = false;
     wifiConnecting = false;
@@ -227,10 +188,6 @@ void checkWiFiConnection() {
     wifiConnected = true;
     wifiConnecting = false;
     isAPMode = false;
-    Serial.println();
-    Serial.print("Connected to WiFi. IP address: ");
-    Serial.println(WiFi.localIP());
-    
     setupWebServer();
     return;
   }
@@ -238,22 +195,8 @@ void checkWiFiConnection() {
   // Check timeout - switch to AP mode if connection fails
   if (elapsed >= WIFI_TIMEOUT_SECONDS) {
     wifiConnecting = false;
-    Serial.println();
-    Serial.println("WiFi connection timeout!");
-    Serial.println("Switching to Access Point mode...");
-    
-    // Start AP mode as fallback
     startAPMode();
     return;
-  }
-  
-  // Show connection progress
-  if (elapsed > 0 && elapsed % 5 == 0) {
-    static unsigned long lastProgress = 0;
-    if (millis() - lastProgress > 1000) {
-      lastProgress = millis();
-      Serial.print(".");
-    }
   }
 }
 
@@ -314,43 +257,21 @@ void loop() {
     // Only monitor connection if in Station mode (not AP mode)
     if (!isAPMode) {
       if (WiFi.status() != WL_CONNECTED && wifiConnected) {
-        // WiFi was connected but now lost
-        Serial.println("WiFi connection lost! Switching to Access Point mode...");
         wifiConnected = false;
-        // Stop the web server when connection is lost
         server.stop();
-        
-        // Switch to AP mode
         startAPMode();
       } else if (WiFi.status() == WL_CONNECTED && !wifiConnected) {
-        // WiFi reconnected
-        Serial.println("WiFi reconnected!");
-        Serial.print("IP address: ");
-        Serial.println(WiFi.localIP());
         wifiConnected = true;
-        
-        // Restart web server after reconnection
         setupWebServer();
       }
       
-      // Attempt to reconnect if disconnected (only if not in AP mode yet)
+      // Attempt to reconnect if disconnected
       if (!wifiConnected && WiFi.status() != WL_CONNECTED && !wifiConnecting) {
         WiFi.disconnect();
         delay(100);
         WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-        Serial.println("Reconnecting to WiFi...");
         wifiConnecting = true;
         wifiStartTime = millis();
-      }
-    }
-    // In AP mode, check if any clients are connected
-    else {
-      int numClients = WiFi.softAPgetStationNum();
-      static int lastNumClients = 0;
-      if (numClients != lastNumClients) {
-        Serial.print("AP Mode - Connected clients: ");
-        Serial.println(numClients);
-        lastNumClients = numClients;
       }
     }
   }
@@ -386,9 +307,8 @@ void loop() {
 }
 
 void checkVehicleState() {
-  // Use peak detection like in the example
-  int cpVoltage = checkAnalog(CP_SENSE_PIN, 100);
-  // Serial.println(cpVoltage);
+  int cpVoltage = checkAnalog(CP_SENSE_PIN, 50);
+  // Serial.println("CP Value: " + String(cpVoltage));
   
   previousVehicleState = currentVehicleState;
   
@@ -407,15 +327,19 @@ void checkVehicleState() {
     currentVehicleState = STATE_F; // Error
   }
   
-  // Debug output
+  // Track state changes for safety delays
   if (currentVehicleState != previousVehicleState) {
-    if (serialDebugEnabled) {
-      Serial.print("State changed: ");
-      Serial.print(getVehicleStateName(previousVehicleState));
-      Serial.print(" -> ");
-      Serial.println(getVehicleStateName(currentVehicleState));
-      Serial.print("CP Voltage (ADC): ");
-      Serial.println(cpVoltage);
+    stateChangeTime = millis();
+    stateStable = false;
+    
+    // Special tracking for STATE_C (ready to charge)
+    if (currentVehicleState == STATE_C) {
+      stateCReadyTime = millis();
+    }
+  } else {
+    // State has been stable for STATE_CHANGE_DELAY
+    if (!stateStable && (millis() - stateChangeTime >= STATE_CHANGE_DELAY)) {
+      stateStable = true;
     }
   }
 }
@@ -438,29 +362,34 @@ void updateChargerState() {
       // Vehicle connected but not ready
       stopCharging();
       chargerState = CHARGER_CONNECTED;
-      PWM_DutyCycle = ampsPWM; // Set PWM for current limit
+      PWM_DutyCycle = ampsPWM;
       ledcWrite(CP_PWM_PIN, PWM_DutyCycle);
-      if (serialDebugEnabled) {
-        Serial.print("STATE_B - Setting PWM to: ");
-        Serial.print(PWM_DutyCycle);
-        Serial.print(" for ");
-        Serial.print(chargingCurrent);
-        Serial.println("A");
-      }
       break;
       
-    case STATE_C:
-      // Vehicle ready to charge
+    case STATE_C: {
+      // Vehicle ready to charge - WITH SAFETY DELAY
+      PWM_DutyCycle = ampsPWM;
+      ledcWrite(CP_PWM_PIN, PWM_DutyCycle);
+      
+      // Check if state is stable and sufficient time has passed
+      unsigned long timeInStateC = millis() - stateCReadyTime;
+      bool safeToCharge = stateStable && (timeInStateC >= STATE_C_READY_DELAY);
+      
       if (autoStartCharging && chargerState != CHARGER_CHARGING) {
-        startCharging();
-        chargerState = CHARGER_CHARGING;
+        if (safeToCharge) {
+          // Only start charging after safety delay
+          startCharging();
+          chargerState = CHARGER_CHARGING;
+        } else {
+          // Waiting for safety delay
+          chargerState = CHARGER_CONNECTED;
+        }
       } else if (!autoStartCharging) {
         stopCharging();
         chargerState = CHARGER_CONNECTED;
       }
-      PWM_DutyCycle = ampsPWM;
-      ledcWrite(CP_PWM_PIN, PWM_DutyCycle);
       break;
+    }
       
     case STATE_D:
       // Ventilation required (not supported in this version)
@@ -489,7 +418,23 @@ void updateChargerState() {
 }
 
 void startCharging() {
-  Serial.println("Starting charging...");
+  // Final safety check - only close contactor if in STATE_C
+  if (currentVehicleState != STATE_C) {
+    return; // Abort if not in STATE_C
+  }
+  
+  // Verify state has been stable
+  if (!stateStable) {
+    return; // Abort if state not stable
+  }
+  
+  // Verify sufficient time in STATE_C
+  unsigned long timeInStateC = millis() - stateCReadyTime;
+  if (timeInStateC < STATE_C_READY_DELAY) {
+    return; // Abort if not enough time has passed
+  }
+  
+  // All safety checks passed - proceed with charging
   int ampsPWM = chargingPWM(chargingCurrent);
   PWM_DutyCycle = ampsPWM;
   ledcWrite(CP_PWM_PIN, PWM_DutyCycle);
@@ -498,15 +443,12 @@ void startCharging() {
   contactorClosed = true;
   chargingStartTime = millis();
   chargingDuration = 0;
-  Serial.println("Charging started!");
 }
 
 void stopCharging() {
   if (contactorClosed) {
-    Serial.println("Stopping charging...");
     digitalWrite(CONTACTOR_PIN, LOW);
     contactorClosed = false;
-    Serial.println("Charging stopped!");
   }
 }
 
@@ -539,7 +481,21 @@ void updateDisplay() {
   // State
   display.setCursor(0, 14);
   display.print("State: ");
-  display.println(getChargerStateName(chargerState));
+  
+  // Show safety delay countdown if in STATE_C waiting
+  if (currentVehicleState == STATE_C && chargerState != CHARGER_CHARGING && autoStartCharging) {
+    unsigned long timeInStateC = millis() - stateCReadyTime;
+    if (timeInStateC < STATE_C_READY_DELAY) {
+      unsigned long remainingTime = (STATE_C_READY_DELAY - timeInStateC) / 1000;
+      display.print("Ready (");
+      display.print(remainingTime);
+      display.println("s)");
+    } else {
+      display.println(getChargerStateName(chargerState));
+    }
+  } else {
+    display.println(getChargerStateName(chargerState));
+  }
   
   // Voltage and Current
   display.setCursor(0, 24);
@@ -604,12 +560,12 @@ void updateDisplay() {
 
 String getVehicleStateName(VehicleState state) {
   switch (state) {
-    case STATE_A: return "A-No Vehicle";
-    case STATE_B: return "B-Connected";
-    case STATE_C: return "C-Charging";
-    case STATE_D: return "D-Vent Req";
-    case STATE_E: return "E-No Power";
-    case STATE_F: return "F-EVSE Error";
+    case STATE_A: return "A: No Vehicle";
+    case STATE_B: return "B: Connected";
+    case STATE_C: return "C: Charging";
+    case STATE_D: return "D: Vent Req";
+    case STATE_E: return "E: No Power";
+    case STATE_F: return "F: EVSE Error";
     default: return "Unknown";
   }
 }
@@ -1135,23 +1091,10 @@ const char* getSettingsHTMLTemplate() {
         </div>
       </div>
 
-      <div class="settings-section">
-        <h3>Debug Options</h3>
-        
-        <div class="setting-item">
-          <label class="setting-label">Serial Debug Output</label>
-          <div class="setting-description">Enable detailed debug messages on Serial Monitor</div>
-          <div class="checkbox-container">
-            <input type="checkbox" id="serialDebug" name="serialDebug" value="1" %SERIAL_DEBUG_CHECKED%>
-            <label for="serialDebug">Enable debug messages</label>
-          </div>
-        </div>
-      </div>
-
       <div class="info-box">
         <strong>Note:</strong> Charging current settings are automatically saved to flash memory 
-        and will persist after reboot. Other settings (max/min limits, auto-start, display interval, 
-        and debug mode) are applied immediately but will reset to defaults on reboot.
+        and will persist after reboot. Other settings (max/min limits, auto-start, display interval) 
+        are applied immediately but will reset to defaults on reboot.
       </div>
 
       <div>
@@ -1243,15 +1186,7 @@ void handleSetCurrent() {
     // Validate current range using configured limits
     if (newCurrent >= minCurrentLimit && newCurrent <= maxCurrentLimit) {
       chargingCurrent = newCurrent;
-      
-      // Save to flash memory
       saveChargingCurrent();
-      
-      if (serialDebugEnabled) {
-        Serial.print("Web: Current set to ");
-        Serial.print(chargingCurrent);
-        Serial.println("A");
-      }
       
       // Update PWM immediately if in appropriate state
       if (currentVehicleState == STATE_B || currentVehicleState == STATE_C) {
@@ -1260,7 +1195,6 @@ void handleSetCurrent() {
         ledcWrite(CP_PWM_PIN, PWM_DutyCycle);
       }
       
-      // Redirect back to main page
       server.sendHeader("Location", "/");
       server.send(303);
     } else {
@@ -1274,11 +1208,8 @@ void handleSetCurrent() {
 
 // Route handler: Emergency stop
 void handleEmergencyStop() {
-  Serial.println("Web: Emergency stop activated!");
   stopCharging();
   chargerState = CHARGER_ERROR;
-  
-  // Redirect back to main page
   server.sendHeader("Location", "/");
   server.send(303);
 }
@@ -1336,7 +1267,6 @@ String getSettingsHTML() {
   html.replace("%MIN_CURRENT%", String((int)minCurrentLimit));
   html.replace("%AUTO_START_CHECKED%", autoStartCharging ? "checked" : "");
   html.replace("%DISPLAY_INTERVAL%", String(displayUpdateInterval));
-  html.replace("%SERIAL_DEBUG_CHECKED%", serialDebugEnabled ? "checked" : "");
   html.replace("%WIFI_MODE%", wifiMode);
   html.replace("%IP%", ipAddress);
   
@@ -1360,16 +1290,8 @@ void handleSaveSettings() {
     float newCurrent = server.arg("defaultCurrent").toFloat();
     if (newCurrent >= 6 && newCurrent <= 32) {
       chargingCurrent = newCurrent;
-      
-      // Save to flash memory
       saveChargingCurrent();
-      
       updated = true;
-      if (serialDebugEnabled) {
-        Serial.print("Settings: Default current set to ");
-        Serial.print(chargingCurrent);
-        Serial.println("A");
-      }
     }
   }
   
@@ -1379,11 +1301,6 @@ void handleSaveSettings() {
     if (newMax >= 6 && newMax <= 32) {
       maxCurrentLimit = newMax;
       updated = true;
-      if (serialDebugEnabled) {
-        Serial.print("Settings: Max current limit set to ");
-        Serial.print(maxCurrentLimit);
-        Serial.println("A");
-      }
     }
   }
   
@@ -1393,20 +1310,11 @@ void handleSaveSettings() {
     if (newMin >= 6 && newMin <= 32) {
       minCurrentLimit = newMin;
       updated = true;
-      if (serialDebugEnabled) {
-        Serial.print("Settings: Min current limit set to ");
-        Serial.print(minCurrentLimit);
-        Serial.println("A");
-      }
     }
   }
   
   // Update auto-start charging
   autoStartCharging = server.hasArg("autoStart");
-  if (serialDebugEnabled) {
-    Serial.print("Settings: Auto-start charging ");
-    Serial.println(autoStartCharging ? "enabled" : "disabled");
-  }
   
   // Update display interval
   if (server.hasArg("displayInterval")) {
@@ -1414,20 +1322,7 @@ void handleSaveSettings() {
     if (newInterval >= 100 && newInterval <= 2000) {
       displayUpdateInterval = newInterval;
       updated = true;
-      if (serialDebugEnabled) {
-        Serial.print("Settings: Display update interval set to ");
-        Serial.print(displayUpdateInterval);
-        Serial.println("ms");
-      }
     }
-  }
-  
-  // Update serial debug
-  bool oldDebug = serialDebugEnabled;
-  serialDebugEnabled = server.hasArg("serialDebug");
-  if (oldDebug != serialDebugEnabled) {
-    Serial.print("Settings: Serial debug ");
-    Serial.println(serialDebugEnabled ? "enabled" : "disabled");
   }
   
   // Update PWM if currently in STATE_B or STATE_C
@@ -1449,12 +1344,8 @@ void handleResetSettings() {
   minCurrentLimit = MIN_CURRENT;
   autoStartCharging = true;
   displayUpdateInterval = 500;
-  serialDebugEnabled = true;
   
-  // Save default current to flash memory
   saveChargingCurrent();
-  
-  Serial.println("Settings: Reset to factory defaults");
   
   // Update PWM if needed
   if (currentVehicleState == STATE_B || currentVehicleState == STATE_C) {
@@ -1463,7 +1354,6 @@ void handleResetSettings() {
     ledcWrite(CP_PWM_PIN, PWM_DutyCycle);
   }
   
-  // Redirect back to settings page with success parameter
   server.sendHeader("Location", "/settings?saved=true");
   server.send(303);
 }
@@ -1483,7 +1373,5 @@ void setupWebServer() {
   server.on("/saveSettings", HTTP_GET, handleSaveSettings);
   server.on("/resetSettings", HTTP_GET, handleResetSettings);
   server.onNotFound(handleNotFound);
-  
   server.begin();
-  Serial.println("Web server started!");
 }

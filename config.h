@@ -58,12 +58,12 @@
 #define CP_9V_MAX       3999
 
 // STATE_C - Vehicle ready, charging (~6V)
-#define CP_6V_MIN       3400
+#define CP_6V_MIN       3000
 #define CP_6V_MAX       3699
 
 // STATE_D - Ventilation required (~3V)
 #define CP_3V_MIN       2800
-#define CP_3V_MAX       3000
+#define CP_3V_MAX       2999
 
 // STATE_E - No power/error (~0V)
 #define CP_0V_MIN       2000
@@ -92,14 +92,13 @@ const IPAddress AP_IP(192, 168, 4, 1);    // AP IP address
 const IPAddress AP_GATEWAY(192, 168, 4, 1);
 const IPAddress AP_SUBNET(255, 255, 255, 0);
 
-// Debugging tips if WiFi won't connect:
+// WiFi troubleshooting tips:
 // 1. Double-check SSID and password
 // 2. Ensure router is on 2.4GHz band
 // 3. Check if MAC filtering is enabled on router
 // 4. Try moving closer to the router
-// 5. Check Serial Monitor for detailed status messages
-// 6. Verify router is not at maximum client limit
-// 7. If WiFi fails, charger will create hotspot (AP mode) automatically
+// 5. Verify router is not at maximum client limit
+// 6. If WiFi fails, charger will create hotspot (AP mode) automatically
 
 // ========================================
 // WEB SERVER CONFIGURATION
@@ -112,7 +111,11 @@ const IPAddress AP_SUBNET(255, 255, 255, 0);
 // ========================================
 
 #define STATE_CHECK_INTERVAL    100   // How often to check vehicle state
-#define DISPLAY_UPDATE_INTERVAL 500   // How often to update OLED display
+#define DISPLAY_UPDATE_INTERVAL 1000   // How often to update OLED display
 #define PZEM_READ_INTERVAL      250   // How often to read PZEM data
+
+// Safety delays to prevent accidental contactor closure
+#define STATE_CHANGE_DELAY      2000  // Wait 2 seconds after state change before allowing actions
+#define STATE_C_READY_DELAY     3000  // Wait 3 seconds in STATE_C before closing contactor
 
 #endif // CONFIG_H
