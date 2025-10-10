@@ -62,6 +62,7 @@ unsigned long wifiStartTime = 0;
 bool contactorClosed = false;
 bool wifiConnected = false;
 bool wifiConnecting = false;
+bool isAPMode = false;  // Track if we're in Access Point mode
 
 int PWM_DutyCycle = 0;
 
@@ -168,7 +169,50 @@ void startWiFiConnection() {
   Serial.println(WIFI_SSID);
   
   wifiConnecting = true;
+  wifiConnected = false;
+  isAPMode = false;
   wifiStartTime = millis();
+}
+
+// Start Access Point mode (fallback when WiFi connection fails)
+void startAPMode() {
+  Serial.println("Starting Access Point mode...");
+  
+  // Disconnect from any WiFi network
+  WiFi.disconnect(true);
+  delay(100);
+  
+  // Configure Access Point
+  WiFi.mode(WIFI_AP);
+  delay(100);
+  
+  // Set custom IP configuration
+  WiFi.softAPConfig(AP_IP, AP_GATEWAY, AP_SUBNET);
+  
+  // Start Access Point
+  bool apStarted = WiFi.softAP(AP_SSID, AP_PASSWORD);
+  
+  if (apStarted) {
+    Serial.println("Access Point started successfully!");
+    Serial.print("AP SSID: ");
+    Serial.println(AP_SSID);
+    Serial.print("AP Password: ");
+    Serial.println(AP_PASSWORD);
+    Serial.print("AP IP address: ");
+    Serial.println(WiFi.softAPIP());
+    
+    isAPMode = true;
+    wifiConnected = true;  // Mark as connected for web server
+    wifiConnecting = false;
+    
+    // Start web server in AP mode
+    setupWebServer();
+  } else {
+    Serial.println("Failed to start Access Point!");
+    isAPMode = false;
+    wifiConnected = false;
+    wifiConnecting = false;
+  }
 }
 
 // Check WiFi connection status (non-blocking)
@@ -182,6 +226,7 @@ void checkWiFiConnection() {
   if (WiFi.status() == WL_CONNECTED) {
     wifiConnected = true;
     wifiConnecting = false;
+    isAPMode = false;
     Serial.println();
     Serial.print("Connected to WiFi. IP address: ");
     Serial.println(WiFi.localIP());
@@ -190,26 +235,24 @@ void checkWiFiConnection() {
     return;
   }
   
-  // Check timeout
+  // Check timeout - switch to AP mode if connection fails
   if (elapsed >= WIFI_TIMEOUT_SECONDS) {
-    wifiConnected = false;
     wifiConnecting = false;
     Serial.println();
     Serial.println("WiFi connection timeout!");
-    Serial.println("Continuing without WiFi...");
+    Serial.println("Switching to Access Point mode...");
+    
+    // Start AP mode as fallback
+    startAPMode();
     return;
   }
   
-  // Retry every 20 seconds
-  if (elapsed > 0 && elapsed % 20 == 0) {
-    static unsigned long lastRetry = 0;
-    if (millis() - lastRetry > 1000) {
-      lastRetry = millis();
-      Serial.println();
-      Serial.println("Retrying WiFi connection...");
-      WiFi.disconnect();
-      delay(100);
-      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  // Show connection progress
+  if (elapsed > 0 && elapsed % 5 == 0) {
+    static unsigned long lastProgress = 0;
+    if (millis() - lastProgress > 1000) {
+      lastProgress = millis();
+      Serial.print(".");
     }
   }
 }
@@ -268,31 +311,47 @@ void loop() {
   if (currentMillis - lastWiFiCheck >= 30000) {
     lastWiFiCheck = currentMillis;
     
-    if (WiFi.status() != WL_CONNECTED && wifiConnected) {
-      // WiFi was connected but now lost
-      Serial.println("WiFi connection lost! Attempting to reconnect...");
-      wifiConnected = false;
-      // Stop the web server when connection is lost
-      server.stop();
-    } else if (WiFi.status() == WL_CONNECTED && !wifiConnected) {
-      // WiFi reconnected
-      Serial.println("WiFi reconnected!");
-      Serial.print("IP address: ");
-      Serial.println(WiFi.localIP());
-      wifiConnected = true;
+    // Only monitor connection if in Station mode (not AP mode)
+    if (!isAPMode) {
+      if (WiFi.status() != WL_CONNECTED && wifiConnected) {
+        // WiFi was connected but now lost
+        Serial.println("WiFi connection lost! Switching to Access Point mode...");
+        wifiConnected = false;
+        // Stop the web server when connection is lost
+        server.stop();
+        
+        // Switch to AP mode
+        startAPMode();
+      } else if (WiFi.status() == WL_CONNECTED && !wifiConnected) {
+        // WiFi reconnected
+        Serial.println("WiFi reconnected!");
+        Serial.print("IP address: ");
+        Serial.println(WiFi.localIP());
+        wifiConnected = true;
+        
+        // Restart web server after reconnection
+        setupWebServer();
+      }
       
-      // Restart web server after reconnection
-      setupWebServer();
+      // Attempt to reconnect if disconnected (only if not in AP mode yet)
+      if (!wifiConnected && WiFi.status() != WL_CONNECTED && !wifiConnecting) {
+        WiFi.disconnect();
+        delay(100);
+        WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+        Serial.println("Reconnecting to WiFi...");
+        wifiConnecting = true;
+        wifiStartTime = millis();
+      }
     }
-    
-    // Attempt to reconnect if disconnected
-    if (!wifiConnected && WiFi.status() != WL_CONNECTED) {
-      WiFi.disconnect();
-      delay(100);
-      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-      Serial.println("Reconnecting to WiFi...");
-      wifiConnecting = true;
-      wifiStartTime = millis();
+    // In AP mode, check if any clients are connected
+    else {
+      int numClients = WiFi.softAPgetStationNum();
+      static int lastNumClients = 0;
+      if (numClients != lastNumClients) {
+        Serial.print("AP Mode - Connected clients: ");
+        Serial.println(numClients);
+        lastNumClients = numClients;
+      }
     }
   }
 
@@ -513,9 +572,15 @@ void updateDisplay() {
     display.print("WiFi: ");
     display.print(elapsed);
     display.print("s...");
-  } else if (wifiConnected && WiFi.status() == WL_CONNECTED) {
-    display.print("IP: ");
-    display.println(WiFi.localIP());
+  } else if (wifiConnected) {
+    // Show connection info based on mode
+    if (isAPMode) {
+      display.print("AP: ");
+      display.println(WiFi.softAPIP());
+    } else if (WiFi.status() == WL_CONNECTED) {
+      display.print("IP: ");
+      display.println(WiFi.localIP());
+    }
   } else if (chargerState == CHARGER_CHARGING || chargingDuration > 0) {
     display.print("Time: ");
     int hours = chargingDuration / 3600;
@@ -827,7 +892,7 @@ const char* getHTMLTemplate() {
     </div>
 
     <div style="margin-top: 20px; color: #7f8c8d; font-size: 0.9em;">
-      IP: %IP% | Uptime: <span id="uptime">%UPTIME%</span> | PWM: <span id="pwm">%PWM%</span>
+      %WIFI_MODE% | IP: %IP% | Uptime: <span id="uptime">%UPTIME%</span> | PWM: <span id="pwm">%PWM%</span>
     </div>
   </div>
 </body>
@@ -1096,7 +1161,7 @@ const char* getSettingsHTMLTemplate() {
     </form>
 
     <div style="margin-top: 20px; color: #7f8c8d; font-size: 0.9em;">
-      EV Charger v1.0 | IP: %IP%
+      EV Charger v1.0 | %WIFI_MODE% | IP: %IP%
     </div>
   </div>
 </body>
@@ -1132,6 +1197,17 @@ String getHTML() {
     statusClass = "status error";
   }
   
+  // Get IP address and WiFi mode
+  String ipAddress;
+  String wifiMode;
+  if (isAPMode) {
+    ipAddress = WiFi.softAPIP().toString();
+    wifiMode = "Mode: Access Point";
+  } else {
+    ipAddress = WiFi.localIP().toString();
+    wifiMode = "Mode: Station";
+  }
+  
   // Replace all placeholders - do this more efficiently
   html.replace("%STATUS_CLASS%", statusClass);
   html.replace("%STATE%", getChargerStateName(chargerState));
@@ -1141,7 +1217,8 @@ String getHTML() {
   html.replace("%POWER%", String(power, 1));
   html.replace("%ENERGY%", String(energy, 2));
   html.replace("%SET_CURRENT%", String((int)chargingCurrent));
-  html.replace("%IP%", WiFi.localIP().toString());
+  html.replace("%WIFI_MODE%", wifiMode);
+  html.replace("%IP%", ipAddress);
   html.replace("%UPTIME%", formatUptime(millis() / 1000));
   html.replace("%PWM%", String(PWM_DutyCycle));
   
@@ -1242,6 +1319,17 @@ void handleData() {
 String getSettingsHTML() {
   String html = String(getSettingsHTMLTemplate());
   
+  // Get IP address and WiFi mode
+  String ipAddress;
+  String wifiMode;
+  if (isAPMode) {
+    ipAddress = WiFi.softAPIP().toString();
+    wifiMode = "Mode: Access Point";
+  } else {
+    ipAddress = WiFi.localIP().toString();
+    wifiMode = "Mode: Station";
+  }
+  
   // Replace all placeholders
   html.replace("%DEFAULT_CURRENT%", String((int)chargingCurrent));
   html.replace("%MAX_CURRENT%", String((int)maxCurrentLimit));
@@ -1249,7 +1337,8 @@ String getSettingsHTML() {
   html.replace("%AUTO_START_CHECKED%", autoStartCharging ? "checked" : "");
   html.replace("%DISPLAY_INTERVAL%", String(displayUpdateInterval));
   html.replace("%SERIAL_DEBUG_CHECKED%", serialDebugEnabled ? "checked" : "");
-  html.replace("%IP%", WiFi.localIP().toString());
+  html.replace("%WIFI_MODE%", wifiMode);
+  html.replace("%IP%", ipAddress);
   
   return html;
 }

@@ -73,6 +73,7 @@
 // WIFI CONFIGURATION
 // ========================================
 
+// STATION MODE (Connect to existing WiFi network)
 // IMPORTANT: Verify these settings!
 // - SSID is case-sensitive
 // - Password must be exact
@@ -81,7 +82,15 @@
 
 const char* WIFI_SSID = "Pond";
 const char* WIFI_PASSWORD = "84383972Aa";
-const int WIFI_TIMEOUT_SECONDS = 120;  // WiFi connection timeout
+const int WIFI_TIMEOUT_SECONDS = 30;  // WiFi connection timeout before switching to AP mode
+
+// ACCESS POINT MODE (Fallback hotspot if WiFi connection fails)
+// This creates a WiFi hotspot that you can connect to directly
+const char* AP_SSID = "EVSE-Charger";
+const char* AP_PASSWORD = "evse1234";  // Minimum 8 characters for WPA2
+const IPAddress AP_IP(192, 168, 4, 1);    // AP IP address
+const IPAddress AP_GATEWAY(192, 168, 4, 1);
+const IPAddress AP_SUBNET(255, 255, 255, 0);
 
 // Debugging tips if WiFi won't connect:
 // 1. Double-check SSID and password
@@ -90,6 +99,7 @@ const int WIFI_TIMEOUT_SECONDS = 120;  // WiFi connection timeout
 // 4. Try moving closer to the router
 // 5. Check Serial Monitor for detailed status messages
 // 6. Verify router is not at maximum client limit
+// 7. If WiFi fails, charger will create hotspot (AP mode) automatically
 
 // ========================================
 // WEB SERVER CONFIGURATION
