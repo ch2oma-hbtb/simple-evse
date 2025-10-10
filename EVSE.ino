@@ -243,6 +243,9 @@ int chargingPWM(int ampsToConvert) {
   // Duty cycle % = (Current / 0.6) for 6-51A range
   float dutyPercent = (float)ampsToConvert / 0.6;
   
+  // Apply duty cycle adjustment from config.h
+  dutyPercent += DUTY_CYCLE_ADJUSTMENT;
+  
   // Clamp between 10% and 96%
   if (dutyPercent < 10) dutyPercent = 10;
   if (dutyPercent > 96) dutyPercent = 96;

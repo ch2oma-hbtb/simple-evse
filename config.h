@@ -40,6 +40,11 @@
 #define MIN_CURRENT     6     // Minimum charging current
 #define DEFAULT_CURRENT 8     // Default startup current
 
+// PWM Duty Cycle Adjustment
+// Adjust this value if the measured duty cycle differs from expected
+// Positive values increase duty cycle, negative values decrease it
+#define DUTY_CYCLE_ADJUSTMENT 3.0  // Percentage adjustment (+2%)
+
 // ========================================
 // CP VOLTAGE THRESHOLDS (ADC values after voltage divider)
 // ========================================
@@ -74,8 +79,8 @@
 // - Router must support 2.4GHz (ESP32 doesn't support 5GHz)
 // - Check router security settings (WPA2 recommended)
 
-const char* WIFI_SSID = "";
-const char* WIFI_PASSWORD = "";
+const char* WIFI_SSID = "Pond";
+const char* WIFI_PASSWORD = "84383972Aa";
 const int WIFI_TIMEOUT_SECONDS = 120;  // WiFi connection timeout
 
 // Debugging tips if WiFi won't connect:
