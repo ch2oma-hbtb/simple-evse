@@ -114,8 +114,10 @@ const IPAddress AP_SUBNET(255, 255, 255, 0);
 #define DISPLAY_UPDATE_INTERVAL 1000   // How often to update OLED display
 #define PZEM_READ_INTERVAL      250   // How often to read PZEM data
 
-// Safety delays to prevent accidental contactor closure
-#define STATE_CHANGE_DELAY      2000  // Wait 2 seconds after state change before allowing actions
-#define STATE_C_READY_DELAY     3000  // Wait 3 seconds in STATE_C before closing contactor
+// Universal state change safety delay
+// This delay applies to ALL state transitions to prevent spurious state changes
+// caused by voltage spikes, noise, or temporary connection issues
+// The state must remain stable for this duration before being confirmed
+#define STATE_CHANGE_DELAY      2000  // Wait 2 seconds for any state change confirmation
 
 #endif // CONFIG_H

@@ -35,12 +35,13 @@ Preferences preferences;
 
 VehicleState currentVehicleState = STATE_A;
 VehicleState previousVehicleState = STATE_A;
+VehicleState confirmedVehicleState = STATE_A;  // State confirmed after delay
 ChargerState chargerState = CHARGER_IDLE;
 
-// State change safety timing
+// Universal state change safety timing
 unsigned long stateChangeTime = 0;
-unsigned long stateCReadyTime = 0;
-bool stateStable = false;
+VehicleState pendingState = STATE_A;
+bool stateConfirmed = true;
 
 float chargingCurrent = DEFAULT_CURRENT;
 float voltage = 0;
@@ -67,6 +68,7 @@ bool contactorClosed = false;
 bool wifiConnected = false;
 bool wifiConnecting = false;
 bool isAPMode = false;  // Track if we're in Access Point mode
+bool displayAvailable = false;  // Track if OLED display is available
 
 int PWM_DutyCycle = 0;
 
@@ -117,17 +119,20 @@ void setup() {
 
   // Initialize OLED display
   if (!display.begin(I2C_ADDRESS, true)) {
-    while (1); // Halt if display fails
+    // Display failed to initialize - continue without it
+    displayAvailable = false;
+  } else {
+    // Display initialized successfully
+    displayAvailable = true;
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SH110X_WHITE);
+    display.setCursor(0, 0);
+    display.println("EV Charger v1.0");
+    display.println("Initializing...");
+    display.display();
+    delay(2000);
   }
-
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SH110X_WHITE);
-  display.setCursor(0, 0);
-  display.println("EV Charger v1.0");
-  display.println("Initializing...");
-  display.display();
-  delay(2000);
 
   // Start WiFi connection in non-blocking mode
   startWiFiConnection();
@@ -294,8 +299,8 @@ void loop() {
     readPZEMData();
   }
   
-  // Update display based on configured interval
-  if (currentMillis - lastDisplayUpdate >= displayUpdateInterval) {
+  // Update display based on configured interval (only if display is available)
+  if (displayAvailable && currentMillis - lastDisplayUpdate >= displayUpdateInterval) {
     lastDisplayUpdate = currentMillis;
     updateDisplay();
   }
@@ -310,41 +315,60 @@ void checkVehicleState() {
   int cpVoltage = checkAnalog(CP_SENSE_PIN, 50);
   // Serial.println("CP Value: " + String(cpVoltage));
   
-  previousVehicleState = currentVehicleState;
+  // Determine raw vehicle state based on CP voltage
+  VehicleState detectedState;
   
-  // Determine vehicle state based on CP voltage
   if (cpVoltage >= CP_12V_MIN && cpVoltage <= CP_12V_MAX) {
-    currentVehicleState = STATE_A; // No vehicle
+    detectedState = STATE_A; // No vehicle
   } else if (cpVoltage >= CP_9V_MIN && cpVoltage <= CP_9V_MAX) {
-    currentVehicleState = STATE_B; // Vehicle connected, not ready
+    detectedState = STATE_B; // Vehicle connected, not ready
   } else if (cpVoltage >= CP_6V_MIN && cpVoltage <= CP_6V_MAX) {
-    currentVehicleState = STATE_C; // Vehicle ready, charging
+    detectedState = STATE_C; // Vehicle ready, charging
   } else if (cpVoltage >= CP_3V_MIN && cpVoltage <= CP_3V_MAX) {
-    currentVehicleState = STATE_D; // Ventilation required
+    detectedState = STATE_D; // Ventilation required
   } else if (cpVoltage >= CP_0V_MIN && cpVoltage <= CP_0V_MAX) {
-    currentVehicleState = STATE_E; // No power
+    detectedState = STATE_E; // No power
   } else {
-    currentVehicleState = STATE_F; // Error
+    detectedState = STATE_F; // Error
   }
   
-  // Track state changes for safety delays
-  if (currentVehicleState != previousVehicleState) {
-    stateChangeTime = millis();
-    stateStable = false;
-    
-    // Special tracking for STATE_C (ready to charge)
-    if (currentVehicleState == STATE_C) {
-      stateCReadyTime = millis();
+  // Universal state change confirmation logic
+  if (detectedState != confirmedVehicleState) {
+    // Detected state is different from confirmed state
+    if (detectedState == pendingState) {
+      // Same pending state detected again - check if enough time has passed
+      unsigned long timeSinceChange = millis() - stateChangeTime;
+      if (timeSinceChange >= STATE_CHANGE_DELAY) {
+        // State has been stable for required duration - confirm it
+        previousVehicleState = confirmedVehicleState;
+        confirmedVehicleState = pendingState;
+        currentVehicleState = confirmedVehicleState;
+        stateConfirmed = true;
+      } else {
+        // Still waiting for confirmation
+        stateConfirmed = false;
+      }
+    } else {
+      // New different state detected - start new confirmation timer
+      pendingState = detectedState;
+      stateChangeTime = millis();
+      stateConfirmed = false;
     }
   } else {
-    // State has been stable for STATE_CHANGE_DELAY
-    if (!stateStable && (millis() - stateChangeTime >= STATE_CHANGE_DELAY)) {
-      stateStable = true;
-    }
+    // Detected state matches confirmed state - all is stable
+    currentVehicleState = confirmedVehicleState;
+    pendingState = confirmedVehicleState;
+    stateConfirmed = true;
   }
 }
 
 void updateChargerState() {
+  // Only act on CONFIRMED states to prevent spurious changes
+  if (!stateConfirmed) {
+    // State is not yet confirmed - don't make any changes
+    return;
+  }
+  
   int ampsPWM = chargingPWM(chargingCurrent);
   
   switch (currentVehicleState) {
@@ -366,30 +390,20 @@ void updateChargerState() {
       ledcWrite(CP_PWM_PIN, PWM_DutyCycle);
       break;
       
-    case STATE_C: {
-      // Vehicle ready to charge - WITH SAFETY DELAY
+    case STATE_C:
+      // Vehicle ready to charge
       PWM_DutyCycle = ampsPWM;
       ledcWrite(CP_PWM_PIN, PWM_DutyCycle);
       
-      // Check if state is stable and sufficient time has passed
-      unsigned long timeInStateC = millis() - stateCReadyTime;
-      bool safeToCharge = stateStable && (timeInStateC >= STATE_C_READY_DELAY);
-      
       if (autoStartCharging && chargerState != CHARGER_CHARGING) {
-        if (safeToCharge) {
-          // Only start charging after safety delay
-          startCharging();
-          chargerState = CHARGER_CHARGING;
-        } else {
-          // Waiting for safety delay
-          chargerState = CHARGER_CONNECTED;
-        }
+        // State is confirmed, safe to start charging
+        startCharging();
+        chargerState = CHARGER_CHARGING;
       } else if (!autoStartCharging) {
         stopCharging();
         chargerState = CHARGER_CONNECTED;
       }
       break;
-    }
       
     case STATE_D:
       // Ventilation required (not supported in this version)
@@ -418,20 +432,9 @@ void updateChargerState() {
 }
 
 void startCharging() {
-  // Final safety check - only close contactor if in STATE_C
-  if (currentVehicleState != STATE_C) {
-    return; // Abort if not in STATE_C
-  }
-  
-  // Verify state has been stable
-  if (!stateStable) {
-    return; // Abort if state not stable
-  }
-  
-  // Verify sufficient time in STATE_C
-  unsigned long timeInStateC = millis() - stateCReadyTime;
-  if (timeInStateC < STATE_C_READY_DELAY) {
-    return; // Abort if not enough time has passed
+  // Safety check - only close contactor if state is confirmed
+  if (!stateConfirmed || currentVehicleState != STATE_C) {
+    return; // Abort if state not confirmed or not in STATE_C
   }
   
   // All safety checks passed - proceed with charging
@@ -482,17 +485,14 @@ void updateDisplay() {
   display.setCursor(0, 14);
   display.print("State: ");
   
-  // Show safety delay countdown if in STATE_C waiting
-  if (currentVehicleState == STATE_C && chargerState != CHARGER_CHARGING && autoStartCharging) {
-    unsigned long timeInStateC = millis() - stateCReadyTime;
-    if (timeInStateC < STATE_C_READY_DELAY) {
-      unsigned long remainingTime = (STATE_C_READY_DELAY - timeInStateC) / 1000;
-      display.print("Ready (");
-      display.print(remainingTime);
-      display.println("s)");
-    } else {
-      display.println(getChargerStateName(chargerState));
-    }
+  // Show state confirmation countdown if waiting
+  if (!stateConfirmed) {
+    unsigned long timeWaiting = millis() - stateChangeTime;
+    unsigned long remainingTime = (STATE_CHANGE_DELAY - timeWaiting) / 1000;
+    display.print(getVehicleStateName(pendingState));
+    display.print(" (");
+    display.print(remainingTime);
+    display.println("s)");
   } else {
     display.println(getChargerStateName(chargerState));
   }
