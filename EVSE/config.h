@@ -5,6 +5,15 @@
 // PIN CONFIGURATION
 // ========================================
 
+// Board: Seeed XIAO ESP32C3. Its variant does no pin remapping, so the Dx/Ax
+// names below are plain aliases for GPIO numbers and the raw integers used for
+// the PZEM are literal GPIOs:
+//   A0 -> GPIO2 (ADC1_CH2)    D3 -> GPIO5    D10 -> GPIO10
+//   PZEM 20/21 -> GPIO20/21 (UART0)    OLED SDA/SCL -> GPIO6/GPIO7
+// This does not hold on Arduino-style boards that define BOARD_HAS_PIN_REMAP,
+// where raw pin numbers are remapped -- re-derive from the variant's
+// pins_arduino.h if the board ever changes.
+
 // Control Pilot (CP) pins
 #define CP_SENSE_PIN    A0   // Analog pin for CP voltage sensing
 #define CP_PWM_PIN      D10  // PWM pin for CP signal generation
@@ -112,12 +121,58 @@ const IPAddress AP_SUBNET(255, 255, 255, 0);
 
 #define STATE_CHECK_INTERVAL    100   // How often to check vehicle state
 #define DISPLAY_UPDATE_INTERVAL 1000   // How often to update OLED display
-#define PZEM_READ_INTERVAL      250   // How often to read PZEM data
 
-// Universal state change safety delay
-// This delay applies to ALL state transitions to prevent spurious state changes
-// caused by voltage spikes, noise, or temporary connection issues
-// The state must remain stable for this duration before being confirmed
+// PZEM polling. The library blocks for up to 100ms when the meter does not
+// answer, so polling fast is expensive when the meter is missing or unpowered.
+#define PZEM_READ_INTERVAL      1000  // How often to read PZEM data
+#define PZEM_FAIL_LIMIT         5     // Consecutive failed reads before the meter is declared offline
+#define PZEM_RETRY_INTERVAL     10000 // Polling interval once the meter is offline
+
+// WiFi link maintenance (all non-blocking)
+#define WIFI_CHECK_INTERVAL     30000 // How often to inspect / repair the WiFi link
+#define STA_RETRY_WINDOW        8000  // How long an AP-mode retry waits for the station link
+
+// State change confirmation delay.
+// A newly detected state must be read continuously for this long before it is
+// confirmed, which keeps voltage spikes and a partially seated connector from
+// starting a charge. This gates STARTING only -- stopping is always immediate,
+// see the raw-reading check in checkVehicleState().
 #define STATE_CHANGE_DELAY      2000  // Wait 2 seconds for any state change confirmation
+
+// ========================================
+// SAFETY
+// ========================================
+
+// Contactor re-close hold-off. Once the contactor opens for any reason it stays
+// open at least this long, so a single noisy reading cannot make it chatter.
+#define CONTACTOR_RECLOSE_DELAY 3000
+
+// CP sampling window, in microseconds. The pilot is a 1kHz square wave and the
+// state is encoded in its positive peak, so the sampler must span several full
+// periods to be sure of catching that peak. Expressed as a time window rather
+// than a sample count so it does not depend on how fast analogRead() happens
+// to be. 3000us = 3 periods.
+#define CP_SAMPLE_WINDOW_US     3000
+
+// How many consecutive out-of-State-C samples force the contactor open.
+// At STATE_CHECK_INTERVAL (100ms) per sample, 2 means the cable is de-energised
+// within ~200ms of the pilot changing, while a single bad reading is ignored.
+#define CONTACTOR_TRIP_SAMPLES  2
+
+// Over-current protection: measured current (PZEM) vs. the current the pilot
+// advertises to the vehicle. MARGIN absorbs meter tolerance at low currents.
+#define OVERCURRENT_MARGIN      1.0   // Amps added on top of both thresholds
+#define OVERCURRENT_SOFT_RATIO  1.10  // 110% of the advertised current...
+#define OVERCURRENT_SOFT_TIME   5000  // ...must persist this long to trip
+#define OVERCURRENT_HARD_RATIO  1.50  // 150% trips quickly
+#define OVERCURRENT_HARD_TIME   1000
+
+// ========================================
+// DISPLAY POWER SAVING
+// ========================================
+
+// Blank the OLED after this long without a state change while idle (0 disables).
+// It wakes on any vehicle/charger state change. Saves panel life and a little heat.
+#define DISPLAY_SLEEP_TIMEOUT   600000  // 10 minutes
 
 #endif // CONFIG_H

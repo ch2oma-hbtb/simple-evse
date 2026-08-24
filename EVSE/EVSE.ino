@@ -72,6 +72,40 @@ bool displayAvailable = false;  // Track if OLED display is available
 
 int PWM_DutyCycle = 0;
 
+// Fault latch. Once set, the contactor stays open and no charge may start until
+// the fault is cleared -- either by unplugging the vehicle or from the web UI.
+bool faultLatched = false;
+const char* faultReason = "";
+
+// Contactor timing. contactorOpenTime gates re-closing so a glitch cannot
+// chatter the contactor; 0 means "never opened since boot".
+unsigned long contactorOpenTime = 0;
+
+// Consecutive raw CP samples that were not State C, used to force the
+// contactor open without waiting for the state confirmation delay.
+int nonChargeSamples = 0;
+
+// Over-current trip timers (0 = not currently over the threshold)
+unsigned long overCurrentSoftStart = 0;
+unsigned long overCurrentHardStart = 0;
+
+// PZEM health
+int pzemFailCount = 0;
+bool pzemOnline = false;
+
+// Per-session energy, derived from the PZEM's lifetime total
+float sessionStartEnergy = 0;
+float sessionEnergy = 0;
+bool sessionEnergyValid = false;
+
+// Non-blocking station-mode retry while running as an access point
+bool staRetryActive = false;
+unsigned long staRetryStart = 0;
+
+// Display sleep
+unsigned long lastActivityTime = 0;
+bool displaySleeping = false;
+
 // ========================================
 // PREFERENCES (FLASH STORAGE) FUNCTIONS
 // ========================================
@@ -79,18 +113,45 @@ int PWM_DutyCycle = 0;
 void loadSettings() {
   preferences.begin("evse", false);
   chargingCurrent = preferences.getFloat("chargeCurrent", DEFAULT_CURRENT);
-  
-  // Validate the loaded value
-  if (chargingCurrent < MIN_CURRENT || chargingCurrent > MAX_CURRENT) {
+  maxCurrentLimit = preferences.getFloat("maxCurrent", MAX_CURRENT);
+  minCurrentLimit = preferences.getFloat("minCurrent", MIN_CURRENT);
+  autoStartCharging = preferences.getBool("autoStart", true);
+  displayUpdateInterval = preferences.getInt("dispInterval", 500);
+  preferences.end();
+
+  // Validate everything that came out of flash -- a corrupt or stale value must
+  // never widen the current limits beyond what the hardware is rated for.
+  if (maxCurrentLimit < MIN_CURRENT || maxCurrentLimit > MAX_CURRENT) {
+    maxCurrentLimit = MAX_CURRENT;
+  }
+  if (minCurrentLimit < MIN_CURRENT || minCurrentLimit > MAX_CURRENT) {
+    minCurrentLimit = MIN_CURRENT;
+  }
+  if (minCurrentLimit > maxCurrentLimit) {
+    minCurrentLimit = MIN_CURRENT;
+    maxCurrentLimit = MAX_CURRENT;
+  }
+  if (chargingCurrent < minCurrentLimit || chargingCurrent > maxCurrentLimit) {
     chargingCurrent = DEFAULT_CURRENT;
   }
-  
-  preferences.end();
+  if (displayUpdateInterval < 100 || displayUpdateInterval > 2000) {
+    displayUpdateInterval = 500;
+  }
 }
 
 void saveChargingCurrent() {
   preferences.begin("evse", false);
   preferences.putFloat("chargeCurrent", chargingCurrent);
+  preferences.end();
+}
+
+void saveSettings() {
+  preferences.begin("evse", false);
+  preferences.putFloat("chargeCurrent", chargingCurrent);
+  preferences.putFloat("maxCurrent", maxCurrentLimit);
+  preferences.putFloat("minCurrent", minCurrentLimit);
+  preferences.putBool("autoStart", autoStartCharging);
+  preferences.putInt("dispInterval", displayUpdateInterval);
   preferences.end();
 }
 
@@ -134,8 +195,15 @@ void setup() {
     delay(2000);
   }
 
+  lastActivityTime = millis();
+
   // Start WiFi connection in non-blocking mode
   startWiFiConnection();
+
+  // Watchdog on the loop task. Every path through loop() is non-blocking, so a
+  // missed feed means something is genuinely stuck and a reset is the right
+  // answer -- the contactor is driven by a GPIO that resets low.
+  enableLoopWDT();
 }
 
 // Start WiFi connection in non-blocking mode
@@ -205,22 +273,24 @@ void checkWiFiConnection() {
   }
 }
 
-// Function to read analog with peak detection (from example)
-int checkAnalog(int analogPinToTest, int noSamples) {
+// Read the control pilot's positive peak.
+//
+// The pilot is a 1kHz square wave whose positive level encodes the vehicle
+// state, so this samples for a fixed WINDOW of time rather than a fixed number
+// of samples: a sample count only spans a full PWM period if analogRead()
+// happens to be fast enough, and missing the peak once would look exactly like
+// the vehicle changing state.
+int checkAnalog(int analogPinToTest, unsigned long windowMicros) {
   int maximum = 0;
-  int minimum = 5000;
-  int value;
-  
-  for (int i = 0; i <= noSamples; i++) {
-    value = analogRead(analogPinToTest);
-    if (value <= minimum) {
-      minimum = value;
-    }
-    if (value >= maximum) {
+  unsigned long start = micros();
+
+  do {
+    int value = analogRead(analogPinToTest);
+    if (value > maximum) {
       maximum = value;
     }
-  }
-  
+  } while (micros() - start < windowMicros);
+
   return maximum; // Return peak value for PWM signal
 }
 
@@ -247,6 +317,63 @@ int chargingPWM(int ampsToConvert) {
   return pwmValue;
 }
 
+// Inspect and repair the WiFi link. Fully non-blocking: an attempt to move from
+// AP mode back to station mode is started here and finished on a later pass, so
+// vehicle state checking is never stalled waiting for a radio.
+void maintainWiFi(unsigned long currentMillis) {
+  // Finish an in-flight station retry that was started while in AP mode
+  if (staRetryActive) {
+    if (WiFi.status() == WL_CONNECTED) {
+      server.stop();
+      WiFi.mode(WIFI_STA);
+      wifiConnected = true;
+      isAPMode = false;
+      staRetryActive = false;
+      lastWiFiCheck = currentMillis;
+      setupWebServer();
+    } else if (currentMillis - staRetryStart >= STA_RETRY_WINDOW) {
+      // No luck this round - drop the station interface and stay an AP.
+      // Restart the interval here, otherwise the next pass would immediately
+      // launch another retry because the 30s window elapsed during this one.
+      WiFi.mode(WIFI_AP);
+      staRetryActive = false;
+      lastWiFiCheck = currentMillis;
+    }
+    return;
+  }
+
+  if (currentMillis - lastWiFiCheck < WIFI_CHECK_INTERVAL) {
+    return;
+  }
+  lastWiFiCheck = currentMillis;
+
+  if (isAPMode) {
+    // Kick off a station attempt alongside the AP and let the block above
+    // finish it. AP clients keep working throughout.
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    staRetryActive = true;
+    staRetryStart = currentMillis;
+    return;
+  }
+
+  // Station mode: monitor and repair
+  if (WiFi.status() != WL_CONNECTED && wifiConnected) {
+    wifiConnected = false;
+    server.stop();
+    startAPMode();
+  } else if (WiFi.status() == WL_CONNECTED && !wifiConnected) {
+    wifiConnected = true;
+    setupWebServer();
+  } else if (!wifiConnected && !wifiConnecting) {
+    WiFi.disconnect();
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    wifiConnecting = true;
+    wifiStartTime = currentMillis;
+  }
+}
+
 void loop() {
   unsigned long currentMillis = millis();
 
@@ -255,64 +382,45 @@ void loop() {
     checkWiFiConnection();
   }
 
-  // Check WiFi connection status every 30 seconds (if already connected)
-  if (currentMillis - lastWiFiCheck >= 30000) {
-    lastWiFiCheck = currentMillis;
-    
-    // Only monitor connection if in Station mode (not AP mode)
-    if (!isAPMode) {
-      if (WiFi.status() != WL_CONNECTED && wifiConnected) {
-        wifiConnected = false;
-        server.stop();
-        startAPMode();
-      } else if (WiFi.status() == WL_CONNECTED && !wifiConnected) {
-        wifiConnected = true;
-        setupWebServer();
-      }
-      
-      // Attempt to reconnect if disconnected
-      if (!wifiConnected && WiFi.status() != WL_CONNECTED && !wifiConnecting) {
-        WiFi.disconnect();
-        delay(100);
-        WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-        wifiConnecting = true;
-        wifiStartTime = millis();
-      }
-    }
-  }
+  maintainWiFi(currentMillis);
 
-  // Handle web server only if WiFi is connected
-  if (wifiConnected && WiFi.status() == WL_CONNECTED) {
+  // Handle web server if WiFi is connected (STA or AP mode)
+  if (wifiConnected) {
     server.handleClient();
   }
-  
+
   // Check vehicle state every 100ms
-  if (currentMillis - lastStateCheck >= 100) {
+  if (currentMillis - lastStateCheck >= STATE_CHECK_INTERVAL) {
     lastStateCheck = currentMillis;
     checkVehicleState();
     updateChargerState();
   }
-  
-  // Read PZEM data every 250ms
-  if (currentMillis - lastPZEMRead >= PZEM_READ_INTERVAL) {
+
+  // Read PZEM data. Back off hard once the meter stops answering, because each
+  // failed read blocks this loop for up to 100ms inside the PZEM library.
+  unsigned long pzemInterval = (pzemFailCount >= PZEM_FAIL_LIMIT) ? PZEM_RETRY_INTERVAL : PZEM_READ_INTERVAL;
+  if (currentMillis - lastPZEMRead >= pzemInterval) {
     lastPZEMRead = currentMillis;
     readPZEMData();
+    checkOverCurrent();
   }
-  
+
   // Update display based on configured interval (only if display is available)
-  if (displayAvailable && currentMillis - lastDisplayUpdate >= displayUpdateInterval) {
+  if (displayAvailable && currentMillis - lastDisplayUpdate >= (unsigned long)displayUpdateInterval) {
     lastDisplayUpdate = currentMillis;
     updateDisplay();
   }
-  
+
   // Update charging duration
   if (chargerState == CHARGER_CHARGING && contactorClosed) {
     chargingDuration = (currentMillis - chargingStartTime) / 1000;
   }
+
+  feedLoopWDT();
 }
 
 void checkVehicleState() {
-  int cpVoltage = checkAnalog(CP_SENSE_PIN, 50);
+  int cpVoltage = checkAnalog(CP_SENSE_PIN, CP_SAMPLE_WINDOW_US);
   // Serial.println("CP Value: " + String(cpVoltage));
   
   // Determine raw vehicle state based on CP voltage
@@ -331,7 +439,28 @@ void checkVehicleState() {
   } else {
     detectedState = STATE_F; // Error
   }
-  
+
+  // SAFETY: stopping does not wait for the confirmation delay.
+  // That delay exists to keep noise from STARTING a charge. Applying it in the
+  // other direction would leave the cable energised for two full seconds after
+  // the connector is pulled or the pilot faults, so instead the contactor opens
+  // as soon as CONTACTOR_TRIP_SAMPLES consecutive readings are not State C
+  // (~200ms), which is still fast while ignoring a single bad sample.
+  if (detectedState != STATE_C) {
+    if (nonChargeSamples < CONTACTOR_TRIP_SAMPLES) {
+      nonChargeSamples++;
+    }
+  } else {
+    nonChargeSamples = 0;
+  }
+
+  if (contactorClosed && nonChargeSamples >= CONTACTOR_TRIP_SAMPLES) {
+    stopCharging();
+    if (chargerState == CHARGER_CHARGING) {
+      chargerState = CHARGER_CONNECTED;
+    }
+  }
+
   // Universal state change confirmation logic
   if (detectedState != confirmedVehicleState) {
     // Detected state is different from confirmed state
@@ -344,6 +473,7 @@ void checkVehicleState() {
         confirmedVehicleState = pendingState;
         currentVehicleState = confirmedVehicleState;
         stateConfirmed = true;
+        noteActivity();
       } else {
         // Still waiting for confirmation
         stateConfirmed = false;
@@ -362,15 +492,52 @@ void checkVehicleState() {
   }
 }
 
+// Latch a fault: open the contactor and refuse to charge until cleared.
+// Used for operator intent (emergency stop) and for conditions that need a
+// human to look at the installation (over-current). Transient pilot faults
+// deliberately do NOT latch -- they recover on their own once the pilot is
+// valid again, and the confirmation delay already guards the restart.
+void latchFault(const char* reason) {
+  stopCharging();
+  faultLatched = true;
+  faultReason = reason;
+  chargerState = CHARGER_ERROR;
+  noteActivity();
+}
+
+void clearFault() {
+  faultLatched = false;
+  faultReason = "";
+  if (chargerState == CHARGER_ERROR) {
+    chargerState = CHARGER_IDLE;
+  }
+}
+
 void updateChargerState() {
+  // A latched fault outranks everything below it
+  if (faultLatched) {
+    stopCharging();
+    // Unplugging the vehicle is the physical acknowledgement of the fault
+    if (stateConfirmed && currentVehicleState == STATE_A) {
+      clearFault();
+    } else {
+      // Hold a steady +12V pilot: tells the vehicle the EVSE is present but
+      // not available, so it stops asking for power instead of erroring out.
+      PWM_DutyCycle = 1023;
+      ledcWrite(CP_PWM_PIN, PWM_DutyCycle);
+      chargerState = CHARGER_ERROR;
+      return;
+    }
+  }
+
   // Only act on CONFIRMED states to prevent spurious changes
   if (!stateConfirmed) {
     // State is not yet confirmed - don't make any changes
     return;
   }
-  
+
   int ampsPWM = chargingPWM(chargingCurrent);
-  
+
   switch (currentVehicleState) {
     case STATE_A:
       // No vehicle connected
@@ -394,14 +561,19 @@ void updateChargerState() {
       // Vehicle ready to charge
       PWM_DutyCycle = ampsPWM;
       ledcWrite(CP_PWM_PIN, PWM_DutyCycle);
-      
-      if (autoStartCharging && chargerState != CHARGER_CHARGING) {
-        // State is confirmed, safe to start charging
-        startCharging();
-        chargerState = CHARGER_CHARGING;
-      } else if (!autoStartCharging) {
+
+      if (!autoStartCharging) {
         stopCharging();
         chargerState = CHARGER_CONNECTED;
+      } else if (chargerState != CHARGER_CHARGING) {
+        // startCharging() re-runs the safety checks and may decline (for
+        // example during the re-close hold-off), so only claim to be charging
+        // once the contactor has actually closed.
+        if (startCharging()) {
+          chargerState = CHARGER_CHARGING;
+        } else {
+          chargerState = CHARGER_CONNECTED;
+        }
       }
       break;
       
@@ -431,12 +603,20 @@ void updateChargerState() {
   }
 }
 
-void startCharging() {
-  // Safety check - only close contactor if state is confirmed
-  if (!stateConfirmed || currentVehicleState != STATE_C) {
-    return; // Abort if state not confirmed or not in STATE_C
+// Returns true only if the contactor actually closed.
+bool startCharging() {
+  // Safety checks - every one of these must hold before energising the cable
+  if (faultLatched) {
+    return false;
   }
-  
+  if (!stateConfirmed || currentVehicleState != STATE_C) {
+    return false; // Abort if state not confirmed or not in STATE_C
+  }
+  // Re-close hold-off: never slam the contactor straight back after a stop
+  if (contactorOpenTime != 0 && millis() - contactorOpenTime < CONTACTOR_RECLOSE_DELAY) {
+    return false;
+  }
+
   // All safety checks passed - proceed with charging
   int ampsPWM = chargingPWM(chargingCurrent);
   PWM_DutyCycle = ampsPWM;
@@ -446,78 +626,192 @@ void startCharging() {
   contactorClosed = true;
   chargingStartTime = millis();
   chargingDuration = 0;
+
+  // Start a new energy session from the meter's lifetime total
+  sessionStartEnergy = energy;
+  sessionEnergy = 0;
+  sessionEnergyValid = pzemOnline;
+  return true;
 }
 
 void stopCharging() {
   if (contactorClosed) {
     digitalWrite(CONTACTOR_PIN, LOW);
     contactorClosed = false;
+    contactorOpenTime = millis();
   }
+  overCurrentSoftStart = 0;
+  overCurrentHardStart = 0;
 }
 
 void readPZEMData() {
-  voltage = pzem.voltage();
+  // One read is enough to trigger a single Modbus transaction; the library
+  // caches the whole frame for 200ms, so the calls below are free.
+  float v = pzem.voltage();
+
+  if (isnan(v)) {
+    if (pzemFailCount < PZEM_FAIL_LIMIT) {
+      pzemFailCount++;
+    }
+    if (pzemFailCount >= PZEM_FAIL_LIMIT) {
+      pzemOnline = false;
+      voltage = 0;
+      current = 0;
+      power = 0;
+      frequency = 0;
+      powerFactor = 0;
+    }
+    return;
+  }
+
+  pzemFailCount = 0;
+  pzemOnline = true;
+
+  voltage = v;
   current = pzem.current();
   power = pzem.power();
   energy = pzem.energy();
   frequency = pzem.frequency();
   powerFactor = pzem.pf();
-  
+
   // Check for NaN values
-  if (isnan(voltage)) voltage = 0;
   if (isnan(current)) current = 0;
   if (isnan(power)) power = 0;
   if (isnan(energy)) energy = 0;
   if (isnan(frequency)) frequency = 0;
   if (isnan(powerFactor)) powerFactor = 0;
+
+  // Track energy delivered in this charging session
+  if (contactorClosed) {
+    if (!sessionEnergyValid) {
+      // Meter was offline when the session started - start counting from here
+      sessionStartEnergy = energy;
+      sessionEnergyValid = true;
+    }
+    sessionEnergy = energy - sessionStartEnergy;
+    if (sessionEnergy < 0) sessionEnergy = 0;  // meter was reset mid-session
+  }
+}
+
+// Compare measured current against what the pilot advertises to the vehicle.
+// A vehicle that ignores the pilot duty cycle, or a fault in the pilot chain,
+// shows up here as sustained over-current -- nothing else in the firmware was
+// watching for it.
+void checkOverCurrent() {
+  if (!contactorClosed || !pzemOnline) {
+    overCurrentSoftStart = 0;
+    overCurrentHardStart = 0;
+    return;
+  }
+
+  unsigned long now = millis();
+  float softLimit = chargingCurrent * OVERCURRENT_SOFT_RATIO + OVERCURRENT_MARGIN;
+  float hardLimit = chargingCurrent * OVERCURRENT_HARD_RATIO + OVERCURRENT_MARGIN;
+
+  if (current > hardLimit) {
+    if (overCurrentHardStart == 0) {
+      overCurrentHardStart = now;
+    } else if (now - overCurrentHardStart >= OVERCURRENT_HARD_TIME) {
+      latchFault("Over-current");
+      return;
+    }
+  } else {
+    overCurrentHardStart = 0;
+  }
+
+  if (current > softLimit) {
+    if (overCurrentSoftStart == 0) {
+      overCurrentSoftStart = now;
+    } else if (now - overCurrentSoftStart >= OVERCURRENT_SOFT_TIME) {
+      latchFault("Over-current");
+      return;
+    }
+  } else {
+    overCurrentSoftStart = 0;
+  }
+}
+
+// Something worth looking at happened - keep the panel awake
+void noteActivity() {
+  lastActivityTime = millis();
 }
 
 void updateDisplay() {
+  // Power saving: blank the panel when the charger has been sitting idle.
+  // Any state change calls noteActivity() and brings it straight back.
+  if (DISPLAY_SLEEP_TIMEOUT > 0 && !contactorClosed && !faultLatched &&
+      millis() - lastActivityTime >= DISPLAY_SLEEP_TIMEOUT) {
+    if (!displaySleeping) {
+      display.clearDisplay();
+      display.display();
+      display.oled_command(SH110X_DISPLAYOFF);
+      displaySleeping = true;
+    }
+    return;
+  }
+  if (displaySleeping) {
+    display.oled_command(SH110X_DISPLAYON);
+    displaySleeping = false;
+  }
+
   display.clearDisplay();
   display.setTextSize(1);
   display.setCursor(0, 0);
-  
+
   // Title
   display.println("EV CHARGER");
   display.drawLine(0, 10, SCREEN_WIDTH, 10, SH110X_WHITE);
-  
+
   // State
   display.setCursor(0, 14);
-  display.print("State: ");
-  
-  // Show state confirmation countdown if waiting
-  if (!stateConfirmed) {
+
+  if (faultLatched) {
+    display.print("FAULT:");
+    display.println(faultReason);
+  } else if (!stateConfirmed) {
+    // Show state confirmation countdown if waiting
     unsigned long timeWaiting = millis() - stateChangeTime;
     unsigned long remainingTime = (STATE_CHANGE_DELAY - timeWaiting) / 1000;
+    display.print("State: ");
     display.print(getVehicleStateName(pendingState));
     display.print(" (");
     display.print(remainingTime);
     display.println("s)");
   } else {
+    display.print("State: ");
     display.println(getChargerStateName(chargerState));
   }
-  
+
   // Voltage and Current
   display.setCursor(0, 24);
-  display.print("V:");
-  display.print(voltage, 1);
-  display.print("V I:");
-  display.print(current, 2);
-  display.println("A");
-  
+  if (pzemOnline) {
+    display.print("V:");
+    display.print(voltage, 1);
+    display.print("V I:");
+    display.print(current, 2);
+    display.println("A");
+  } else {
+    display.println("Meter: offline");
+  }
+
   // Power and PWM info
   display.setCursor(0, 34);
   display.print("P:");
   display.print(power, 1);
   display.print("W PWM:");
   display.println(PWM_DutyCycle);
-  
-  // Energy
+
+  // Energy: this session while one is running, lifetime total otherwise
   display.setCursor(0, 44);
-  display.print("E:");
-  display.print(energy, 2);
+  if (sessionEnergy > 0 || contactorClosed) {
+    display.print("S:");
+    display.print(sessionEnergy, 2);
+  } else {
+    display.print("E:");
+    display.print(energy, 2);
+  }
   display.print("kWh Set:");
-  display.print(chargingCurrent);
+  display.print(chargingCurrent, 0);
   display.println("A");
 
   // IP Address (always show if WiFi connected) or Charging duration
@@ -585,9 +879,13 @@ String getChargerStateName(ChargerState state) {
 // WEB SERVER FUNCTIONS
 // ========================================
 
-// HTML template for the web interface
-const char* getHTMLTemplate() {
-  return R"rawliteral(
+// Both pages below are fully static and are streamed straight out of flash with
+// server.send_P(). Nothing is templated into them and no String is built per
+// request -- every dynamic value arrives through /data instead. That matters on
+// a charger that stays powered for months: the old approach copied ~8KB to the
+// heap and reallocated it a dozen times on every page load, which fragments the
+// heap until the web server stops responding.
+static const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE HTML>
 <html>
 <head>
@@ -711,6 +1009,21 @@ const char* getHTMLTemplate() {
     .emergency-stop:hover {
       background-color: #c0392b;
     }
+    .fault-banner {
+      display: none;
+      background-color: #e74c3c;
+      color: white;
+      padding: 15px;
+      border-radius: 5px;
+      margin: 20px 0;
+      font-weight: bold;
+    }
+    .clear-fault {
+      background-color: #e67e22;
+    }
+    .clear-fault:hover {
+      background-color: #d35400;
+    }
     .quick-buttons {
       margin: 15px 0;
     }
@@ -743,24 +1056,45 @@ const char* getHTMLTemplate() {
     }
   </style>
   <script>
+    // Timestamp of the last slider touch. The 2s poll must not yank the slider
+    // out from under someone who is still dragging it.
+    var sliderTouched = 0;
+
+    function txt(id, value) {
+      document.getElementById(id).innerText = value;
+    }
+
     function updateData() {
       fetch('/data')
         .then(response => response.json())
         .then(data => {
-          document.getElementById('voltage').innerText = data.voltage;
-          document.getElementById('current').innerText = data.current;
-          document.getElementById('power').innerText = data.power;
-          document.getElementById('energy').innerText = data.energy;
-          document.getElementById('setCurrent').innerText = data.setCurrent;
-          document.getElementById('currentSlider').value = data.setCurrent;
-          document.getElementById('sliderValue').innerText = data.setCurrent;
-          document.getElementById('chargerState').innerText = data.chargerState;
-          document.getElementById('vehicleState').innerText = data.vehicleState;
-          document.getElementById('uptime').innerText = data.uptime;
-          document.getElementById('pwm').innerText = data.pwm;
-          
-          // Update status class
-          let statusDiv = document.getElementById('statusDiv');
+          txt('voltage', data.meter ? data.voltage : '--');
+          txt('current', data.meter ? data.current : '--');
+          txt('power', data.meter ? data.power : '--');
+          txt('energy', data.meter ? data.energy : '--');
+          txt('sessionEnergy', data.meter ? data.sessionEnergy : '--');
+          txt('setCurrent', data.setCurrent);
+          txt('chargerState', data.chargerState);
+          txt('vehicleState', data.vehicleState);
+          txt('uptime', data.uptime);
+          txt('pwm', data.pwm);
+          txt('wifiMode', data.wifiMode);
+          txt('ip', data.ip);
+
+          if (Date.now() - sliderTouched > 10000) {
+            document.getElementById('currentSlider').value = data.setCurrent;
+            txt('sliderValue', data.setCurrent);
+          }
+
+          var banner = document.getElementById('faultBanner');
+          if (data.fault) {
+            banner.style.display = 'block';
+            txt('faultReason', data.faultReason);
+          } else {
+            banner.style.display = 'none';
+          }
+
+          var statusDiv = document.getElementById('statusDiv');
           statusDiv.className = 'status';
           if (data.chargerState === 'Charging') {
             statusDiv.className = 'status charging';
@@ -770,12 +1104,46 @@ const char* getHTMLTemplate() {
         })
         .catch(error => console.error('Error fetching data:', error));
     }
-    
+
+    // State-changing endpoints are POST so that a browser prefetch, a bookmark
+    // or a network scanner cannot trip the charger by fetching a URL.
+    function post(url) {
+      return fetch(url, { method: 'POST' })
+        .then(updateData)
+        .catch(error => console.error('Request failed:', error));
+    }
+
+    function applyCurrent() {
+      sliderTouched = 0;
+      post('/setCurrent?value=' + document.getElementById('currentSlider').value);
+    }
+
+    function quickSet(value) {
+      sliderTouched = 0;
+      post('/setCurrent?value=' + value);
+    }
+
+    function emergencyStop() {
+      if (confirm('Are you sure you want to emergency stop?')) {
+        post('/emergencyStop');
+      }
+    }
+
+    function clearFault() {
+      post('/clearFault');
+    }
+
     // Update every 2 seconds
     setInterval(updateData, 2000);
-    
-    // Initial update
-    window.onload = updateData;
+
+    window.onload = function() {
+      var slider = document.getElementById('currentSlider');
+      slider.addEventListener('input', function() {
+        sliderTouched = Date.now();
+        txt('sliderValue', slider.value);
+      });
+      updateData();
+    };
   </script>
 </head>
 <body>
@@ -787,78 +1155,82 @@ const char* getHTMLTemplate() {
       <a href="/settings" class="nav-btn">Settings</a>
     </div>
     
-    <div id="statusDiv" class="status %STATUS_CLASS%">
-      <h2>Status: <span id="chargerState">%STATE%</span></h2>
-      <div>Vehicle State: <span id="vehicleState">%VEHICLE_STATE%</span></div>
+    <div id="faultBanner" class="fault-banner">
+      FAULT LATCHED: <span id="faultReason"></span><br>
+      Charging is blocked until this is cleared or the vehicle is unplugged.
+      <br>
+      <button class="clear-fault" onclick="clearFault()">Clear Fault</button>
+    </div>
+
+    <div id="statusDiv" class="status">
+      <h2>Status: <span id="chargerState">--</span></h2>
+      <div>Vehicle State: <span id="vehicleState">--</span></div>
     </div>
 
     <div class="readings-grid">
       <div class="reading-card">
         <div class="reading-label">Voltage</div>
-        <div class="reading-value"><span id="voltage">%VOLTAGE%</span> V</div>
+        <div class="reading-value"><span id="voltage">--</span> V</div>
       </div>
       <div class="reading-card">
         <div class="reading-label">Current</div>
-        <div class="reading-value"><span id="current">%CURRENT%</span> A</div>
+        <div class="reading-value"><span id="current">--</span> A</div>
       </div>
       <div class="reading-card">
         <div class="reading-label">Power</div>
-        <div class="reading-value"><span id="power">%POWER%</span> W</div>
+        <div class="reading-value"><span id="power">--</span> W</div>
       </div>
       <div class="reading-card">
-        <div class="reading-label">Energy</div>
-        <div class="reading-value"><span id="energy">%ENERGY%</span> kWh</div>
+        <div class="reading-label">This Session</div>
+        <div class="reading-value"><span id="sessionEnergy">--</span> kWh</div>
+      </div>
+      <div class="reading-card">
+        <div class="reading-label">Total Energy</div>
+        <div class="reading-value"><span id="energy">--</span> kWh</div>
       </div>
     </div>
 
     <div class="control-section">
       <h3>Charging Current Limit</h3>
-      <div class="current-display"><span id="setCurrent">%SET_CURRENT%</span> A</div>
-      
-      <form action="/setCurrent" method="GET">
-        <div class="slider-container">
-          <input type="range" min="6" max="32" value="%SET_CURRENT%" 
-                 class="slider" id="currentSlider" name="value" 
-                 oninput="document.getElementById('sliderValue').innerText=this.value">
-        </div>
-        <div style="font-size: 1.5em; margin: 10px 0;">
-          <span id="sliderValue">%SET_CURRENT%</span> A
-        </div>
-        <button type="submit">Set Current</button>
-      </form>
+      <div class="current-display"><span id="setCurrent">--</span> A</div>
+
+      <div class="slider-container">
+        <input type="range" min="6" max="32" value="8"
+               class="slider" id="currentSlider" name="value">
+      </div>
+      <div style="font-size: 1.5em; margin: 10px 0;">
+        <span id="sliderValue">8</span> A
+      </div>
+      <button type="button" onclick="applyCurrent()">Set Current</button>
 
       <div class="quick-buttons">
         <strong>Quick Set:</strong><br>
-        <a href="/setCurrent?value=6"><button class="quick-btn">6A</button></a>
-        <a href="/setCurrent?value=8"><button class="quick-btn">8A</button></a>
-        <a href="/setCurrent?value=10"><button class="quick-btn">10A</button></a>
-        <a href="/setCurrent?value=16"><button class="quick-btn">16A</button></a>
-        <a href="/setCurrent?value=20"><button class="quick-btn">20A</button></a>
-        <a href="/setCurrent?value=32"><button class="quick-btn">32A</button></a>
+        <button class="quick-btn" onclick="quickSet(6)">6A</button>
+        <button class="quick-btn" onclick="quickSet(8)">8A</button>
+        <button class="quick-btn" onclick="quickSet(10)">10A</button>
+        <button class="quick-btn" onclick="quickSet(16)">16A</button>
+        <button class="quick-btn" onclick="quickSet(20)">20A</button>
+        <button class="quick-btn" onclick="quickSet(32)">32A</button>
       </div>
     </div>
 
     <div>
-      <a href="/emergencyStop">
-        <button class="emergency-stop" 
-                onclick="return confirm('Are you sure you want to emergency stop?')">
-          EMERGENCY STOP
-        </button>
-      </a>
+      <button class="emergency-stop" onclick="emergencyStop()">
+        EMERGENCY STOP
+      </button>
     </div>
 
     <div style="margin-top: 20px; color: #7f8c8d; font-size: 0.9em;">
-      %WIFI_MODE% | IP: %IP% | Uptime: <span id="uptime">%UPTIME%</span> | PWM: <span id="pwm">%PWM%</span>
+      <span id="wifiMode">--</span> | IP: <span id="ip">--</span> |
+      Uptime: <span id="uptime">--</span> | PWM: <span id="pwm">--</span>
     </div>
   </div>
 </body>
 </html>
 )rawliteral";
-}
 
 // HTML template for settings page
-const char* getSettingsHTMLTemplate() {
-  return R"rawliteral(
+static const char SETTINGS_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE HTML>
 <html>
 <head>
@@ -1006,26 +1378,48 @@ const char* getSettingsHTMLTemplate() {
   </style>
   <script>
     function showSuccess() {
-      const msg = document.getElementById('successMessage');
+      var msg = document.getElementById('successMessage');
       msg.style.display = 'block';
-      setTimeout(() => {
+      setTimeout(function() {
         msg.style.display = 'none';
       }, 3000);
     }
-    
+
+    // The page ships static; current values are fetched once on load.
+    function loadValues() {
+      return fetch('/data')
+        .then(response => response.json())
+        .then(data => {
+          document.getElementById('defaultCurrent').value = data.setCurrent;
+          document.getElementById('maxCurrent').value = data.maxCurrent;
+          document.getElementById('minCurrent').value = data.minCurrent;
+          document.getElementById('autoStart').checked = data.autoStart;
+          document.getElementById('displayInterval').value = data.displayInterval;
+          document.getElementById('wifiMode').innerText = data.wifiMode;
+          document.getElementById('ip').innerText = data.ip;
+        })
+        .catch(error => console.error('Error fetching settings:', error));
+    }
+
+    function saveSettings(event) {
+      event.preventDefault();
+      var form = document.getElementById('settingsForm');
+      fetch('/saveSettings', { method: 'POST', body: new URLSearchParams(new FormData(form)) })
+        .then(loadValues)
+        .then(showSuccess)
+        .catch(error => console.error('Save failed:', error));
+    }
+
     function resetDefaults() {
       if (confirm('Reset all settings to factory defaults?')) {
-        window.location.href = '/resetSettings';
+        fetch('/resetSettings', { method: 'POST' })
+          .then(loadValues)
+          .then(showSuccess)
+          .catch(error => console.error('Reset failed:', error));
       }
     }
-    
-    // Check if we came from a save operation
-    window.onload = function() {
-      const urlParams = new URLSearchParams(window.location.search);
-      if (urlParams.get('saved') === 'true') {
-        showSuccess();
-      }
-    }
+
+    window.onload = loadValues;
   </script>
 </head>
 <body>
@@ -1041,29 +1435,29 @@ const char* getSettingsHTMLTemplate() {
       Settings saved successfully!
     </div>
 
-    <form action="/saveSettings" method="GET">
+    <form id="settingsForm" action="/saveSettings" method="POST" onsubmit="saveSettings(event)">
       <div class="settings-section">
         <h3>Current Limits</h3>
-        
+
         <div class="setting-item">
           <label class="setting-label" for="defaultCurrent">Default Charging Current</label>
           <div class="setting-description">Initial current setting when charger starts (6-32A)</div>
-          <input type="number" id="defaultCurrent" name="defaultCurrent" 
-                 min="6" max="32" step="1" value="%DEFAULT_CURRENT%">
+          <input type="number" id="defaultCurrent" name="defaultCurrent"
+                 min="6" max="32" step="1" value="8">
         </div>
 
         <div class="setting-item">
           <label class="setting-label" for="maxCurrent">Maximum Current Limit</label>
           <div class="setting-description">Hardware maximum current limit (6-32A)</div>
-          <input type="number" id="maxCurrent" name="maxCurrent" 
-                 min="6" max="32" step="1" value="%MAX_CURRENT%">
+          <input type="number" id="maxCurrent" name="maxCurrent"
+                 min="6" max="32" step="1" value="32">
         </div>
 
         <div class="setting-item">
           <label class="setting-label" for="minCurrent">Minimum Current Limit</label>
           <div class="setting-description">Hardware minimum current limit (6-32A)</div>
-          <input type="number" id="minCurrent" name="minCurrent" 
-                 min="6" max="32" step="1" value="%MIN_CURRENT%">
+          <input type="number" id="minCurrent" name="minCurrent"
+                 min="6" max="32" step="1" value="6">
         </div>
       </div>
 
@@ -1074,7 +1468,7 @@ const char* getSettingsHTMLTemplate() {
           <label class="setting-label">Auto-Start Charging</label>
           <div class="setting-description">Automatically start charging when vehicle is ready (State C)</div>
           <div class="checkbox-container">
-            <input type="checkbox" id="autoStart" name="autoStart" value="1" %AUTO_START_CHECKED%>
+            <input type="checkbox" id="autoStart" name="autoStart" value="1">
             <label for="autoStart">Enable automatic charging</label>
           </div>
         </div>
@@ -1086,15 +1480,14 @@ const char* getSettingsHTMLTemplate() {
         <div class="setting-item">
           <label class="setting-label" for="displayInterval">Display Update Interval</label>
           <div class="setting-description">How often to update the OLED display (milliseconds)</div>
-          <input type="number" id="displayInterval" name="displayInterval" 
-                 min="100" max="2000" step="100" value="%DISPLAY_INTERVAL%">
+          <input type="number" id="displayInterval" name="displayInterval"
+                 min="100" max="2000" step="100" value="500">
         </div>
       </div>
 
       <div class="info-box">
-        <strong>Note:</strong> Charging current settings are automatically saved to flash memory 
-        and will persist after reboot. Other settings (max/min limits, auto-start, display interval) 
-        are applied immediately but will reset to defaults on reboot.
+        <strong>Note:</strong> All settings on this page are saved to flash memory
+        and persist after reboot.
       </div>
 
       <div>
@@ -1104,13 +1497,12 @@ const char* getSettingsHTMLTemplate() {
     </form>
 
     <div style="margin-top: 20px; color: #7f8c8d; font-size: 0.9em;">
-      EV Charger v1.0 | %WIFI_MODE% | IP: %IP%
+      EV Charger v1.0 | <span id="wifiMode">--</span> | IP: <span id="ip">--</span>
     </div>
   </div>
 </body>
 </html>
 )rawliteral";
-}
 
 // Helper function to format uptime
 String formatUptime(unsigned long seconds) {
@@ -1128,53 +1520,22 @@ String formatUptime(unsigned long seconds) {
   return uptime;
 }
 
-// Generate HTML page with current values (only called on first load)
-String getHTML() {
-  String html = String(getHTMLTemplate());
-  
-  // Determine status class
-  String statusClass = "status";
-  if (chargerState == CHARGER_CHARGING) {
-    statusClass = "status charging";
-  } else if (chargerState == CHARGER_ERROR) {
-    statusClass = "status error";
-  }
-  
-  // Get IP address and WiFi mode
-  String ipAddress;
-  String wifiMode;
-  if (isAPMode) {
-    ipAddress = WiFi.softAPIP().toString();
-    wifiMode = "Mode: Access Point";
-  } else {
-    ipAddress = WiFi.localIP().toString();
-    wifiMode = "Mode: Station";
-  }
-  
-  // Replace all placeholders - do this more efficiently
-  html.replace("%STATUS_CLASS%", statusClass);
-  html.replace("%STATE%", getChargerStateName(chargerState));
-  html.replace("%VEHICLE_STATE%", getVehicleStateName(currentVehicleState));
-  html.replace("%VOLTAGE%", String(voltage, 1));
-  html.replace("%CURRENT%", String(current, 2));
-  html.replace("%POWER%", String(power, 1));
-  html.replace("%ENERGY%", String(energy, 2));
-  html.replace("%SET_CURRENT%", String((int)chargingCurrent));
-  html.replace("%WIFI_MODE%", wifiMode);
-  html.replace("%IP%", ipAddress);
-  html.replace("%UPTIME%", formatUptime(millis() / 1000));
-  html.replace("%PWM%", String(PWM_DutyCycle));
-  
-  return html;
+void sendNoCacheHeaders() {
+  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  server.sendHeader("Pragma", "no-cache");
+  server.sendHeader("Expires", "0");
 }
 
 // Route handler: Main page
 void handleRoot() {
-  // Add cache control headers to improve performance
-  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-  server.sendHeader("Pragma", "no-cache");
-  server.sendHeader("Expires", "0");
-  server.send(200, "text/html", getHTML());
+  sendNoCacheHeaders();
+  server.send_P(200, "text/html", DASHBOARD_HTML);
+}
+
+// Route handler: Settings page
+void handleSettings() {
+  sendNoCacheHeaders();
+  server.send_P(200, "text/html", SETTINGS_HTML);
 }
 
 // Route handler: Set charging current
@@ -1182,19 +1543,20 @@ void handleSetCurrent() {
   if (server.hasArg("value")) {
     String currentStr = server.arg("value");
     float newCurrent = currentStr.toFloat();
-    
+
     // Validate current range using configured limits
     if (newCurrent >= minCurrentLimit && newCurrent <= maxCurrentLimit) {
       chargingCurrent = newCurrent;
       saveChargingCurrent();
-      
+      noteActivity();
+
       // Update PWM immediately if in appropriate state
       if (currentVehicleState == STATE_B || currentVehicleState == STATE_C) {
         int ampsPWM = chargingPWM(chargingCurrent);
         PWM_DutyCycle = ampsPWM;
         ledcWrite(CP_PWM_PIN, PWM_DutyCycle);
       }
-      
+
       server.sendHeader("Location", "/");
       server.send(303);
     } else {
@@ -1206,134 +1568,108 @@ void handleSetCurrent() {
   }
 }
 
-// Route handler: Emergency stop
+// Route handler: Emergency stop.
+// This LATCHES - without the latch the state machine simply re-closed the
+// contactor on its next 100ms tick, because the vehicle is still sitting in a
+// confirmed State C and nothing recorded that a human had said stop.
 void handleEmergencyStop() {
-  stopCharging();
-  chargerState = CHARGER_ERROR;
+  latchFault("Emergency stop");
   server.sendHeader("Location", "/");
   server.send(303);
 }
 
-// Route handler: JSON data endpoint (optimized for AJAX updates)
+// Route handler: Clear a latched fault
+void handleClearFault() {
+  clearFault();
+  noteActivity();
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+// Route handler: JSON data endpoint (drives both pages)
 void handleData() {
-  // Use more efficient string building
-  String json = "{";
-  json.reserve(256); // Pre-allocate memory to reduce fragmentation
-  json += "\"voltage\":";
-  json += String(voltage, 1);
-  json += ",\"current\":";
-  json += String(current, 2);
-  json += ",\"power\":";
-  json += String(power, 1);
-  json += ",\"energy\":";
-  json += String(energy, 2);
-  json += ",\"setCurrent\":";
-  json += String((int)chargingCurrent);
-  json += ",\"chargerState\":\"";
-  json += getChargerStateName(chargerState);
-  json += "\",\"vehicleState\":\"";
-  json += getVehicleStateName(currentVehicleState);
-  json += "\",\"uptime\":\"";
-  json += formatUptime(millis() / 1000);
-  json += "\",\"pwm\":";
-  json += String(PWM_DutyCycle);
-  json += "}";
-  
-  // Add headers to prevent caching of dynamic data
-  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-  server.sendHeader("Pragma", "no-cache");
-  server.sendHeader("Expires", "0");
+  // Built into a fixed stack buffer: this runs every 2 seconds forever, so it
+  // must not touch the heap.
+  char json[512];
+  String ipAddress = isAPMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString();
+  String uptime = formatUptime(millis() / 1000);
+
+  snprintf(json, sizeof(json),
+           "{\"voltage\":%.1f,\"current\":%.2f,\"power\":%.1f,\"energy\":%.2f,"
+           "\"sessionEnergy\":%.2f,\"setCurrent\":%d,\"chargerState\":\"%s\","
+           "\"vehicleState\":\"%s\",\"uptime\":\"%s\",\"pwm\":%d,"
+           "\"wifiMode\":\"Mode: %s\",\"ip\":\"%s\",\"meter\":%s,"
+           "\"contactor\":%s,\"fault\":%s,\"faultReason\":\"%s\","
+           "\"maxCurrent\":%d,\"minCurrent\":%d,\"autoStart\":%s,"
+           "\"displayInterval\":%d}",
+           voltage, current, power, energy,
+           sessionEnergy, (int)chargingCurrent, getChargerStateName(chargerState).c_str(),
+           getVehicleStateName(currentVehicleState).c_str(), uptime.c_str(), PWM_DutyCycle,
+           isAPMode ? "Access Point" : "Station", ipAddress.c_str(), pzemOnline ? "true" : "false",
+           contactorClosed ? "true" : "false", faultLatched ? "true" : "false", faultReason,
+           (int)maxCurrentLimit, (int)minCurrentLimit, autoStartCharging ? "true" : "false",
+           displayUpdateInterval);
+
+  sendNoCacheHeaders();
   server.send(200, "application/json", json);
-}
-
-// Generate settings HTML page
-String getSettingsHTML() {
-  String html = String(getSettingsHTMLTemplate());
-  
-  // Get IP address and WiFi mode
-  String ipAddress;
-  String wifiMode;
-  if (isAPMode) {
-    ipAddress = WiFi.softAPIP().toString();
-    wifiMode = "Mode: Access Point";
-  } else {
-    ipAddress = WiFi.localIP().toString();
-    wifiMode = "Mode: Station";
-  }
-  
-  // Replace all placeholders
-  html.replace("%DEFAULT_CURRENT%", String((int)chargingCurrent));
-  html.replace("%MAX_CURRENT%", String((int)maxCurrentLimit));
-  html.replace("%MIN_CURRENT%", String((int)minCurrentLimit));
-  html.replace("%AUTO_START_CHECKED%", autoStartCharging ? "checked" : "");
-  html.replace("%DISPLAY_INTERVAL%", String(displayUpdateInterval));
-  html.replace("%WIFI_MODE%", wifiMode);
-  html.replace("%IP%", ipAddress);
-  
-  return html;
-}
-
-// Route handler: Settings page
-void handleSettings() {
-  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-  server.sendHeader("Pragma", "no-cache");
-  server.sendHeader("Expires", "0");
-  server.send(200, "text/html", getSettingsHTML());
 }
 
 // Route handler: Save settings
 void handleSaveSettings() {
-  bool updated = false;
-  
-  // Update default charging current
-  if (server.hasArg("defaultCurrent")) {
-    float newCurrent = server.arg("defaultCurrent").toFloat();
-    if (newCurrent >= 6 && newCurrent <= 32) {
-      chargingCurrent = newCurrent;
-      saveChargingCurrent();
-      updated = true;
-    }
-  }
-  
-  // Update max current limit
+  // Update max/min limits first so the charging current is validated against
+  // the limits that are being saved in this same request.
   if (server.hasArg("maxCurrent")) {
     float newMax = server.arg("maxCurrent").toFloat();
-    if (newMax >= 6 && newMax <= 32) {
+    if (newMax >= MIN_CURRENT && newMax <= MAX_CURRENT) {
       maxCurrentLimit = newMax;
-      updated = true;
     }
   }
-  
-  // Update min current limit
+
   if (server.hasArg("minCurrent")) {
     float newMin = server.arg("minCurrent").toFloat();
-    if (newMin >= 6 && newMin <= 32) {
+    if (newMin >= MIN_CURRENT && newMin <= MAX_CURRENT) {
       minCurrentLimit = newMin;
-      updated = true;
     }
   }
-  
+
+  if (minCurrentLimit > maxCurrentLimit) {
+    minCurrentLimit = MIN_CURRENT;
+    maxCurrentLimit = MAX_CURRENT;
+  }
+
+  if (server.hasArg("defaultCurrent")) {
+    float newCurrent = server.arg("defaultCurrent").toFloat();
+    if (newCurrent >= minCurrentLimit && newCurrent <= maxCurrentLimit) {
+      chargingCurrent = newCurrent;
+    }
+  }
+
+  // Keep the active current inside the (possibly new) limits
+  if (chargingCurrent < minCurrentLimit) chargingCurrent = minCurrentLimit;
+  if (chargingCurrent > maxCurrentLimit) chargingCurrent = maxCurrentLimit;
+
   // Update auto-start charging
   autoStartCharging = server.hasArg("autoStart");
-  
+
   // Update display interval
   if (server.hasArg("displayInterval")) {
     int newInterval = server.arg("displayInterval").toInt();
     if (newInterval >= 100 && newInterval <= 2000) {
       displayUpdateInterval = newInterval;
-      updated = true;
     }
   }
-  
+
+  saveSettings();
+  noteActivity();
+
   // Update PWM if currently in STATE_B or STATE_C
-  if (updated && (currentVehicleState == STATE_B || currentVehicleState == STATE_C)) {
+  if (currentVehicleState == STATE_B || currentVehicleState == STATE_C) {
     int ampsPWM = chargingPWM(chargingCurrent);
     PWM_DutyCycle = ampsPWM;
     ledcWrite(CP_PWM_PIN, PWM_DutyCycle);
   }
-  
-  // Redirect back to settings page with success parameter
-  server.sendHeader("Location", "/settings?saved=true");
+
+  server.sendHeader("Location", "/settings");
   server.send(303);
 }
 
@@ -1344,17 +1680,18 @@ void handleResetSettings() {
   minCurrentLimit = MIN_CURRENT;
   autoStartCharging = true;
   displayUpdateInterval = 500;
-  
-  saveChargingCurrent();
-  
+
+  saveSettings();
+  noteActivity();
+
   // Update PWM if needed
   if (currentVehicleState == STATE_B || currentVehicleState == STATE_C) {
     int ampsPWM = chargingPWM(chargingCurrent);
     PWM_DutyCycle = ampsPWM;
     ledcWrite(CP_PWM_PIN, PWM_DutyCycle);
   }
-  
-  server.sendHeader("Location", "/settings?saved=true");
+
+  server.sendHeader("Location", "/settings");
   server.send(303);
 }
 
@@ -1363,15 +1700,19 @@ void handleNotFound() {
   server.send(404, "text/plain", "404: Not Found");
 }
 
-// Setup web server routes
+// Setup web server routes.
+// Anything that changes charger state is POST-only, so a browser prefetch, a
+// stale bookmark or a network scanner walking the LAN cannot trip the charger
+// by issuing a plain GET.
 void setupWebServer() {
   server.on("/", HTTP_GET, handleRoot);
-  server.on("/setCurrent", HTTP_GET, handleSetCurrent);
-  server.on("/emergencyStop", HTTP_GET, handleEmergencyStop);
-  server.on("/data", HTTP_GET, handleData);
   server.on("/settings", HTTP_GET, handleSettings);
-  server.on("/saveSettings", HTTP_GET, handleSaveSettings);
-  server.on("/resetSettings", HTTP_GET, handleResetSettings);
+  server.on("/data", HTTP_GET, handleData);
+  server.on("/setCurrent", HTTP_POST, handleSetCurrent);
+  server.on("/emergencyStop", HTTP_POST, handleEmergencyStop);
+  server.on("/clearFault", HTTP_POST, handleClearFault);
+  server.on("/saveSettings", HTTP_POST, handleSaveSettings);
+  server.on("/resetSettings", HTTP_POST, handleResetSettings);
   server.onNotFound(handleNotFound);
   server.begin();
 }
